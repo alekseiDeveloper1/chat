@@ -23,6 +23,18 @@ jest.mock('expo-sqlite', () => {
         useSQLiteContext: () => mockDb,
     };
 });
+global.RTCPeerConnection = jest.fn().mockImplementation(() => ({
+  createDataChannel: jest.fn().mockReturnValue({
+    send: jest.fn(),
+    close: jest.fn(),
+  }),
+  createOffer: jest.fn().mockResolvedValue({ sdp: 'mock-offer', type: 'offer' }),
+  setLocalDescription: jest.fn().mockResolvedValue(null),
+  setRemoteDescription: jest.fn().mockResolvedValue(null),
+  addIceCandidate: jest.fn().mockResolvedValue(null),
+  close: jest.fn(),
+}));
+
 beforeEach(() => {
     jest.clearAllMocks();
 });
