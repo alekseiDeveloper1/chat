@@ -1,3 +1,4 @@
+import 'react-native-get-random-values'
 jest.mock('expo-crypto', () => {
     const crypto = require('crypto');
     return {
