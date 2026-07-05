@@ -23,9 +23,7 @@ export class SQLiteMessageRepository implements IMessageRepository {
         room_id TEXT NOT NULL,
         text TEXT NOT NULL,
         sender_id TEXT NOT NULL,
-        timestamp INTEGER NOT NULL,
-        is_forwarded INTEGER DEFAULT 0,
-        forwarded_from TEXT
+        timestamp INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id);
     `);
@@ -35,8 +33,8 @@ export class SQLiteMessageRepository implements IMessageRepository {
     const db = await this.getDbInstance();
 
     await db.runAsync(
-      `INSERT OR REPLACE INTO messages (id, room_id, text, sender_id, timestamp, is_forwarded, forwarded_from)
-       VALUES (?, ?, ?, ?, ?, ?, ?);`,
+      `INSERT OR REPLACE INTO messages (id, room_id, text, sender_id, timestamp)
+       VALUES (?, ?, ?, ?, ?);`,
       [
         message.id,
         message.roomId,

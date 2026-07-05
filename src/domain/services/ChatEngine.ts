@@ -16,10 +16,8 @@ export class ChatEngine {
 
   async joinRoom(roomName: string, password: string, onNewMessage: () => void, onStatusChange: (status: ConnectionStatus) => void): Promise<void> {
     await this.messageRepository.initialize();
-
     this.currentRoomId = await this.cryptoService.generateRoomKey(roomName);
     this.currentRoomKey = await this.cryptoService.generateRoomKey(password);
-
     this.networkService.onStatusChanged(onStatusChange);
 
     this.networkService.onDataReceived(async (rawPayload) => {

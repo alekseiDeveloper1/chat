@@ -1,46 +1,31 @@
 import { registerGlobals, RTCPeerConnection } from 'react-native-webrtc';
-import Paho from 'paho-mqtt';
 import { INetworkService, ConnectionStatus } from '@/domain/services/INetworkService';
-
+import { IStrictDataChannel, IStrictPeerConnection, SignalingPacket } from './webrtcTypes';
+import {
+  DATA_CHANNEL_LABEL,
+  DATA_CHANNEL_OPTIONS,
+  ICE_BATCH_DELAY_MS,
+  RTC_CONFIGURATION,
+  SIGNAL_TYPE,
+  generatePeerId,
+} from './networkConstants';
+import {MqttSignalingService} from "@/data/network/MqttSignalingService";
 registerGlobals();
-
-interface IStrictDataChannel {
-  send(data: string): void;
-  close(): void;
-  addEventListener(type: 'message', listener: (event: { data: string }) => void): void;
-  addEventListener(type: 'open' | 'close', listener: () => void): void;
-}
-
-interface IStrictPeerConnection {
-  iceConnectionState: string;
-  localDescription: any;
-  remoteDescription: any;
-  close(): void;
-  createDataChannel(label: string, options?: object): IStrictDataChannel;
-  createOffer(options?: object): Promise<any>;
-  createAnswer(options?: object): Promise<any>;
-  setLocalDescription(desc: any): Promise<void>;
-  setRemoteDescription(desc: any): Promise<void>;
-  addIceCandidate(candidate: any): Promise<void>;
-  addEventListener(type: 'iceconnectionstatechange', listener: () => void): void;
-  addEventListener(type: 'icecandidate', listener: (event: { candidate: any }) => void): void;
-  addEventListener(type: 'datachannel', listener: (event: { channel: IStrictDataChannel }) => void): void;
-}
 
 export class WebRTCNetworkService implements INetworkService {
   private peerConnection: IStrictPeerConnection | null = null;
   private dataChannel: IStrictDataChannel | null = null;
+  private mqttSignaling: MqttSignalingService | null = null;
 
   private statusCallback: ((status: ConnectionStatus) => void) | null = null;
   private dataCallback: ((payload: string) => void) | null = null;
 
-
   private roomHash: string = '';
-  private mqttClient: Paho.Client | null = null;
-  private myPeerId = Math.floor(Math.random() * 1000000).toString();
+  private myPeerId = generatePeerId();
   private isInitiator = false;
-  private localIceBuffer: any[] = [];
-  private iceTimeoutRef: any = null;
+  private localIceBuffer: unknown[] = [];
+  private iceTimeoutRef: ReturnType<typeof setTimeout> | null = null;
+
   onStatusChanged(callback: (status: ConnectionStatus) => void): void {
     this.statusCallback = callback;
   }
@@ -53,173 +38,177 @@ export class WebRTCNetworkService implements INetworkService {
     this.roomHash = roomHash;
     this.updateStatus('signaling');
 
-    const configuration = {
-      iceServers: [
-        {
-          urls: [
-            'stun:stun.l.google.com:19302'
-          ]
-        }
-      ]
-    };
-
     try {
-      this.peerConnection = new RTCPeerConnection(configuration) as unknown as IStrictPeerConnection;
+      this.peerConnection = new RTCPeerConnection(RTC_CONFIGURATION) as unknown as IStrictPeerConnection;
     } catch (nativeError) {
       console.error(`[CRITICAL ERROR] Нативный конструктор WebRTC рухнул:`, nativeError);
       throw nativeError;
     }
 
-    this.peerConnection.addEventListener('icecandidate', (event) => {
-      if (event.candidate) {
-        this.localIceBuffer.push(event.candidate);
+    this.setupPeerConnectionListeners();
+    this.initMqtt();
+  }
 
-        if (this.iceTimeoutRef) clearTimeout(this.iceTimeoutRef);
 
-        this.iceTimeoutRef = setTimeout(() => {
-          if (this.localIceBuffer.length > 0) {
-            this.publishMqttSignal('ice_batch', this.localIceBuffer);
-            this.localIceBuffer = [];
-          }
-        }, 300);
+  private setupPeerConnectionListeners(): void {
+    this.peerConnection?.addEventListener('icecandidate', (event) => {
+      if (!event.candidate) {
+        return;
       }
+
+      this.localIceBuffer.push(event.candidate);
+
+      if (this.iceTimeoutRef) clearTimeout(this.iceTimeoutRef);
+
+      this.iceTimeoutRef = setTimeout(() => {
+        if (this.localIceBuffer.length > 0) {
+          this.mqttSignaling?.publish(SIGNAL_TYPE.ICE_BATCH, this.localIceBuffer);
+          this.localIceBuffer = [];
+        }
+      }, ICE_BATCH_DELAY_MS);
     });
 
-    this.peerConnection.addEventListener('iceconnectionstatechange', () => {
+    this.peerConnection?.addEventListener('iceconnectionstatechange', () => {
       if (!this.peerConnection) return;
       const state = this.peerConnection.iceConnectionState;
 
       if (state === 'connected') {
         this.updateStatus('connected');
-        this.disconnectMqtt();
+        this.mqttSignaling?.disconnect()
       }
-      if (state === 'failed') this.updateStatus('failed');
-    });
 
-    this.peerConnection.addEventListener('datachannel', (event) => {
-      if (event.channel) this.setupDataChannel(event.channel);
-    });
-
-    this.initMqtt();
-  }
-
-
-  private initMqtt() {
-    const clientId = `expo_chat_${this.myPeerId}_${Math.random().toString(36).substring(7)}`;
-
-      const wssUrl = `wss://broker.hivemq.com:8884/mqtt`;
-
-      this.mqttClient = new Paho.Client(wssUrl, clientId);
-
-    this.mqttClient.onMessageArrived = async (message: Paho.Message) => {
-      try {
-        const rawPayload = message.payloadString;
-        const packet = JSON.parse(rawPayload);
-
-        if (String(packet.senderId) === String(this.myPeerId) || !this.peerConnection) {
-          return;
-        }
-
-        if (packet.type === 'ice_batch' && Array.isArray(packet.payload)) {
-
-          for (const candidate of packet.payload) {
-            if (this.peerConnection.remoteDescription) {
-              await this.peerConnection.addIceCandidate(candidate);
-            }
-          }
-        }
-
-        if (packet.type === 'join' && !this.dataChannel) {
-          this.isInitiator = Number(this.myPeerId) > Number(packet.senderId);
-
-          if (this.isInitiator) {
-            const channel = this.peerConnection.createDataChannel('chat-channel', { ordered: true });
-            this.setupDataChannel(channel);
-
-            const offer = await this.peerConnection.createOffer();
-            await this.peerConnection.setLocalDescription(offer);
-            this.publishMqttSignal('offer', offer);
-          } else {
-            this.publishMqttSignal('hello', { peerId: this.myPeerId });
-          }
-        }
-
-        else if (packet.type === 'hello' && !this.dataChannel && !this.peerConnection.remoteDescription) {
-          this.isInitiator = Number(this.myPeerId) > Number(packet.senderId);
-
-          if (this.isInitiator) {
-            const channel = this.peerConnection.createDataChannel('chat-channel', { ordered: true });
-            this.setupDataChannel(channel);
-
-            const offer = await this.peerConnection.createOffer();
-            await this.peerConnection.setLocalDescription(offer);
-            this.publishMqttSignal('offer', offer);
-          }
-        }
-
-
-        if (packet.type === 'offer' && !this.isInitiator && !this.peerConnection.remoteDescription) {
-          await this.peerConnection.setRemoteDescription(packet.payload);
-          const answer = await this.peerConnection.createAnswer();
-          await this.peerConnection.setLocalDescription(answer);
-          this.publishMqttSignal('answer', answer);
-        }
-
-        if (packet.type === 'answer' && this.isInitiator && !this.peerConnection.remoteDescription) {
-          await this.peerConnection.setRemoteDescription(packet.payload);
-        }
-
-        if (packet.type.startsWith('ice_') && !packet.type.endsWith(this.myPeerId)) {
-          await this.peerConnection.addIceCandidate(packet.payload);
-        }
-
-      } catch (e) { }
-    };
-
-    this.mqttClient.connect({
-      useSSL: true,
-      timeout: 10,
-      keepAliveInterval: 0,
-      reconnect: true,
-
-      onSuccess: () => {
-        const topic = `p2p_chat_room_${this.roomHash}`;
-        this.mqttClient!.subscribe(topic);
-
-        this.publishMqttSignal('join', { peerId: this.myPeerId });
-
-        const pingInterval = setInterval(() => {
-          if (this.mqttClient && this.mqttClient.isConnected()) {
-            this.publishMqttSignal('ping', {});
-          } else {
-            clearInterval(pingInterval); // Если отключились, чистим таймер
-          }
-        }, 30000);
-      },
-      onFailure: (err) => {
-        console.error('[MQTT CONN FAILED] Не удалось подключиться:', err.errorMessage);
+      if (state === 'failed') {
+        console.error('[WebRTC] Соединение ICE упало в статус FAILED');
         this.updateStatus('failed');
       }
     });
 
-
+    this.peerConnection?.addEventListener('datachannel', (event) => {
+      if (event.channel) {
+        this.setupDataChannel(event.channel);
+      }
+    });
   }
 
-  private publishMqttSignal(type: string, payload: any) {
-    if (!this.mqttClient || !this.mqttClient.isConnected()) return;
+  private initMqtt() {
+    this.mqttSignaling = new MqttSignalingService(
+      (packet) => this.handleSignalingPacket(packet),
+      (err) => {
+        console.error('[SIGNALLING] Ошибка сигналинга MQTT:', err);
+        this.updateStatus('failed');
+      },
+    );
+    this.mqttSignaling.connect(this.roomHash, this.myPeerId);
+  }
 
-    const topic = `p2p_chat_room_${this.roomHash}`;
-    const messageBody = JSON.stringify({
-      senderId: this.myPeerId,
-      type,
-      payload
-    });
+  private async handleSignalingPacket(packet: SignalingPacket): Promise<void> {
+    if (String(packet.senderId) === String(this.myPeerId)) {
+      return; // Игнорируем собственные эхо-сообщения из брокера
+    }
 
-    const message = new Paho.Message(messageBody);
-    message.destinationName = topic;
-    message.qos = 1;
+    if (!this.peerConnection) {
+      console.warn(`[SIGNALLING] Получен пакет ${packet.type}, но peerConnection равен null`);
+      return;
+    }
 
-    this.mqttClient.send(message);
+
+    try {
+      await this.dispatchSignalingPacket(packet);
+    } catch (error) {
+      console.error(`[SIGNALLING] Критическая ошибка обработки пакета [${packet.type}]:`, error);
+    }
+  }
+
+  private async dispatchSignalingPacket(packet: SignalingPacket): Promise<void> {
+    if (!this.peerConnection) return;
+
+    switch (packet.type) {
+      case SIGNAL_TYPE.ICE_BATCH:
+        await this.handleIceBatch(packet);
+        break;
+      case SIGNAL_TYPE.JOIN:
+        await this.handleJoin(packet);
+        break;
+      case SIGNAL_TYPE.HELLO:
+        await this.handleHello(packet);
+        break;
+      case SIGNAL_TYPE.OFFER:
+        await this.handleOffer(packet);
+        break;
+      case SIGNAL_TYPE.ANSWER:
+        await this.handleAnswer(packet);
+        break;
+      default:
+        if (packet.type.startsWith('ice_') && !packet.type.endsWith(this.myPeerId)) {
+          await this.peerConnection.addIceCandidate(packet.payload).catch((e) => console.warn('[ICE] Ошибка добавления единичного кандидата:', e));
+        }
+        break;
+    }
+  }
+
+  private async handleIceBatch(packet: SignalingPacket): Promise<void> {
+    if (!this.peerConnection || !Array.isArray(packet.payload)) return;
+
+    for (const candidate of packet.payload) {
+      await this.peerConnection.addIceCandidate(candidate).catch((e) => console.warn('[ICE] Нативный отказ добавления кандидата:', e));
+    }
+  }
+
+  private async handleJoin(packet: SignalingPacket): Promise<void> {
+    if (this.dataChannel || !this.peerConnection) {
+      return;
+    }
+
+    this.isInitiator = Number(this.myPeerId) > Number(packet.senderId);
+
+    if (this.isInitiator) {
+      await this.createOfferAsInitiator();
+    } else {
+      this.mqttSignaling?.publish(SIGNAL_TYPE.HELLO, { peerId: this.myPeerId });
+    }
+  }
+
+  private async createOfferAsInitiator(): Promise<void> {
+    if (!this.peerConnection) return;
+    const channel = this.peerConnection.createDataChannel(DATA_CHANNEL_LABEL, DATA_CHANNEL_OPTIONS);
+    this.setupDataChannel(channel);
+    const offer = await this.peerConnection.createOffer();
+    await this.peerConnection.setLocalDescription(offer);
+    this.mqttSignaling?.publish(SIGNAL_TYPE.OFFER, offer);
+  }
+
+  private async handleHello(packet: SignalingPacket): Promise<void> {
+    if (this.dataChannel || !this.peerConnection || this.peerConnection.remoteDescription) {
+      return;
+    }
+
+    this.isInitiator = Number(this.myPeerId) > Number(packet.senderId);
+
+    if (this.isInitiator) {
+      await this.createOfferAsInitiator();
+    }
+  }
+
+  private async handleOffer(packet: SignalingPacket): Promise<void> {
+    if (this.isInitiator || !this.peerConnection || this.peerConnection.remoteDescription) {
+      console.warn('[SIGNALLING] Пакет OFFER отклонен: я инициатор или RemoteDescription уже задан');
+      return;
+    }
+
+    await this.peerConnection.setRemoteDescription(packet.payload);
+
+    const answer = await this.peerConnection.createAnswer();
+    await this.peerConnection.setLocalDescription(answer);
+
+    this.mqttSignaling?.publish(SIGNAL_TYPE.ANSWER, answer);
+  }
+
+  private async handleAnswer(packet: SignalingPacket): Promise<void> {
+    if (!this.isInitiator || !this.peerConnection || this.peerConnection.remoteDescription) {
+      console.warn('[SIGNALLING] Пакет ANSWER отклонен: я не инициатор или RemoteDescription уже задан');
+      return;
+    }
+    await this.peerConnection.setRemoteDescription(packet.payload);
   }
 
   private setupDataChannel(channel: IStrictDataChannel) {
@@ -234,24 +223,6 @@ export class WebRTCNetworkService implements INetworkService {
   async sendData(payload: string): Promise<void> {
     if (!this.dataChannel) throw new Error('Нет активного P2P соединения');
     this.dataChannel.send(payload);
-  }
-
-  private disconnectMqtt() {
-    if (this.mqttClient && this.mqttClient.isConnected()) {
-      try {
-        this.mqttClient.disconnect();
-      } catch (e) { }
-    }
-    this.mqttClient = null;
-  }
-
-  async disconnect(): Promise<void> {
-    this.disconnectMqtt();
-    if (this.dataChannel) this.dataChannel.close();
-    if (this.peerConnection) this.peerConnection.close();
-    this.dataChannel = null;
-    this.peerConnection = null;
-    this.updateStatus('disconnected');
   }
 
   private updateStatus(status: ConnectionStatus) {
