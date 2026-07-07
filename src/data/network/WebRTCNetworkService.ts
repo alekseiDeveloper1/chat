@@ -1,3 +1,4 @@
+import { router } from 'expo-router';
 import { registerGlobals, RTCPeerConnection } from 'react-native-webrtc';
 import { INetworkService, ConnectionStatus } from '@/domain/services/INetworkService';
 import { IStrictDataChannel, IStrictPeerConnection, SignalingPacket } from './webrtcTypes';
@@ -58,7 +59,10 @@ export class WebRTCNetworkService implements INetworkService {
 
       this.localIceBuffer.push(event.candidate);
 
-      if (this.iceTimeoutRef) clearTimeout(this.iceTimeoutRef);
+      if (this.iceTimeoutRef) {
+        clearTimeout(this.iceTimeoutRef);
+        this.iceTimeoutRef = null;
+      }
 
       this.iceTimeoutRef = setTimeout(() => {
         if (this.localIceBuffer.length > 0) {
@@ -77,9 +81,10 @@ export class WebRTCNetworkService implements INetworkService {
         this.mqttSignaling?.disconnect()
       }
 
-      if (state === 'failed') {
+      if (state === 'failed' || state === 'disconnected') {
         console.error('[WebRTC] Соединение ICE упало в статус FAILED');
         this.updateStatus('failed');
+        this.disconnect()
       }
     });
 
@@ -103,7 +108,7 @@ export class WebRTCNetworkService implements INetworkService {
 
   private async handleSignalingPacket(packet: SignalingPacket): Promise<void> {
     if (String(packet.senderId) === String(this.myPeerId)) {
-      return; // Игнорируем собственные эхо-сообщения из брокера
+      return;
     }
 
     if (!this.peerConnection) {
@@ -223,6 +228,17 @@ export class WebRTCNetworkService implements INetworkService {
   async sendData(payload: string): Promise<void> {
     if (!this.dataChannel) throw new Error('Нет активного P2P соединения');
     this.dataChannel.send(payload);
+  }
+
+  disconnect():void {
+    this.mqttSignaling?.disconnect();
+    if (this.dataChannel) this.dataChannel.close();
+    if (this.peerConnection) this.peerConnection.close();
+
+    this.dataChannel = null;
+    this.peerConnection = null;
+    this.updateStatus('disconnected');
+    router.replace('/');
   }
 
   private updateStatus(status: ConnectionStatus) {

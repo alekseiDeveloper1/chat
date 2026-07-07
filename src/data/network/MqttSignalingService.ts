@@ -34,9 +34,7 @@ export class MqttSignalingService {
       try {
         const packet = JSON.parse(message.payloadString) as SignalingPacket;
         this.onMessage(packet);
-      } catch {
-        // ignore
-      }
+      } catch { }
     };
 
 

@@ -8,4 +8,6 @@ export interface INetworkService {
   onDataReceived(callback: (payload: string) => void): void;
 
   onStatusChanged(callback: (status: ConnectionStatus) => void): void;
+
+  disconnect(): void;
 }
