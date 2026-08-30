@@ -30,7 +30,7 @@ export function useChat() {
       setInRoom(true);
       await refreshMessages();
     } catch (error) {
-      console.error('Не удалось войти в секретную комнату:', error);
+      console.error('Не удалось войти в комнату:', error);
     }
   };
 

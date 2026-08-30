@@ -1,6 +1,7 @@
 import Paho from 'paho-mqtt';
 import {
   MQTT_BROKER_URL,
+  MQTT_CONNECT_OPTIONS,
   MQTT_MESSAGE_QOS,
   MQTT_PING_INTERVAL_MS,
   SIGNAL_TYPE,
@@ -17,6 +18,7 @@ export class MqttSignalingService {
   private pingIntervalRef: ReturnType<typeof setInterval> | null = null;
   private roomHash = '';
   private peerId = '';
+  private connectionGeneration = 0;
 
   constructor(
     private readonly onMessage: SignalingMessageHandler,
@@ -24,30 +26,54 @@ export class MqttSignalingService {
   ) {}
 
   connect(roomHash: string, peerId: string): void {
+    this.disconnect();
+
     this.roomHash = roomHash;
     this.peerId = peerId;
 
     const clientId = buildMqttClientId(peerId);
-    this.mqttClient = new Paho.Client(MQTT_BROKER_URL, clientId);
+    const connectionGeneration = ++this.connectionGeneration;
+    const mqttClient = new Paho.Client(MQTT_BROKER_URL, clientId);
+    this.mqttClient = mqttClient;
 
-    this.mqttClient.onMessageArrived = (message: Paho.Message) => {
+    mqttClient.onMessageArrived = (message: Paho.Message) => {
+      if (!this.isCurrentClient(mqttClient, connectionGeneration)) {
+        return;
+      }
+
       try {
         const packet = JSON.parse(message.payloadString) as SignalingPacket;
         this.onMessage(packet);
       } catch { }
     };
 
+    mqttClient.onConnectionLost = (err) => {
+      if (!this.isCurrentClient(mqttClient, connectionGeneration)) {
+        return;
+      }
 
-    this.mqttClient.connect({
-      useSSL: true,
-      timeout: 15,
-      keepAliveInterval: 0,
-      reconnect: true,
+      this.clearPingInterval();
 
+      if (err.errorCode !== 0) {
+        console.error('[MQTT CONN LOST] MQTT connection lost:', err.errorMessage);
+        this.onConnectionFailure(err.errorMessage);
+      }
+    };
+
+    mqttClient.connect({
+      ...MQTT_CONNECT_OPTIONS,
       onSuccess: () => {
-        this.handleConnectSuccess();
+        if (!this.isCurrentClient(mqttClient, connectionGeneration)) {
+          return;
+        }
+
+        this.handleConnectSuccess(mqttClient, connectionGeneration);
       },
       onFailure: (err) => {
+        if (!this.isCurrentClient(mqttClient, connectionGeneration)) {
+          return;
+        }
+
         console.error('[MQTT CONN FAILED] Коллбэк onFailure сработал:', err.errorMessage);
         this.onConnectionFailure(err.errorMessage);
       },
@@ -72,32 +98,40 @@ export class MqttSignalingService {
   }
 
   disconnect(): void {
+    this.connectionGeneration += 1;
     this.clearPingInterval();
 
-    if (this.mqttClient?.isConnected()) {
+    const mqttClient = this.mqttClient;
+    this.mqttClient = null;
+
+    if (mqttClient?.isConnected()) {
       try {
-        this.mqttClient.disconnect();
+        mqttClient.disconnect();
       } catch {
         // ignore disconnect errors
       }
     }
-
-    this.mqttClient = null;
   }
 
   isConnected(): boolean {
     return this.mqttClient?.isConnected() ?? false;
   }
 
-  private handleConnectSuccess(): void {
+  private handleConnectSuccess(mqttClient: Paho.Client, connectionGeneration: number): void {
     const topic = buildRoomTopic(this.roomHash);
-    this.mqttClient!.subscribe(topic);
+    mqttClient.subscribe(topic);
     this.publish(SIGNAL_TYPE.JOIN, { peerId: this.peerId });
-    this.startPingInterval();
+    this.clearPingInterval();
+    this.startPingInterval(mqttClient, connectionGeneration);
   }
 
-  private startPingInterval(): void {
+  private startPingInterval(mqttClient: Paho.Client, connectionGeneration: number): void {
     this.pingIntervalRef = setInterval(() => {
+      if (!this.isCurrentClient(mqttClient, connectionGeneration)) {
+        this.clearPingInterval();
+        return;
+      }
+
       if (this.isConnected()) {
         this.publish(SIGNAL_TYPE.PING, {});
       } else {
@@ -111,5 +145,9 @@ export class MqttSignalingService {
       clearInterval(this.pingIntervalRef);
       this.pingIntervalRef = null;
     }
+  }
+
+  private isCurrentClient(mqttClient: Paho.Client, connectionGeneration: number): boolean {
+    return this.mqttClient === mqttClient && this.connectionGeneration === connectionGeneration;
   }
 }

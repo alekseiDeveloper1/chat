@@ -6,6 +6,9 @@ import {
   DATA_CHANNEL_LABEL,
   DATA_CHANNEL_OPTIONS,
   ICE_BATCH_DELAY_MS,
+  RECONNECT_BASE_DELAY_MS,
+  RECONNECT_MAX_ATTEMPTS,
+  RECONNECT_MAX_DELAY_MS,
   RTC_CONFIGURATION,
   SIGNAL_TYPE,
   generatePeerId,
@@ -26,6 +29,10 @@ export class WebRTCNetworkService implements INetworkService {
   private isInitiator = false;
   private localIceBuffer: unknown[] = [];
   private iceTimeoutRef: ReturnType<typeof setTimeout> | null = null;
+  private reconnectTimeoutRef: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempt = 0;
+  private connectionGeneration = 0;
+  private isManualDisconnect = true;
 
   onStatusChanged(callback: (status: ConnectionStatus) => void): void {
     this.statusCallback = callback;
@@ -37,22 +44,45 @@ export class WebRTCNetworkService implements INetworkService {
 
   async connect(roomHash: string): Promise<void> {
     this.roomHash = roomHash;
-    this.updateStatus('signaling');
+    this.isManualDisconnect = false;
+    this.reconnectAttempt = 0;
+    this.clearReconnectTimeout();
+    this.startConnection('signaling', true);
+  }
+
+  private startConnection(status: ConnectionStatus, rethrowNativeError = false): void {
+    this.releaseConnectionResources();
+    this.isInitiator = false;
+    this.updateStatus(status);
 
     try {
       this.peerConnection = new RTCPeerConnection(RTC_CONFIGURATION) as unknown as IStrictPeerConnection;
     } catch (nativeError) {
       console.error(`[CRITICAL ERROR] Нативный конструктор WebRTC рухнул:`, nativeError);
+      this.updateStatus('failed');
+
+      if (!rethrowNativeError && !this.isManualDisconnect) {
+        this.scheduleReconnect('native WebRTC constructor failed', this.connectionGeneration, true);
+      }
+
+      if (!rethrowNativeError) {
+        return;
+      }
+
       throw nativeError;
     }
 
-    this.setupPeerConnectionListeners();
-    this.initMqtt();
+    this.setupPeerConnectionListeners(this.connectionGeneration);
+    this.initMqtt(this.connectionGeneration);
   }
 
 
-  private setupPeerConnectionListeners(): void {
+  private setupPeerConnectionListeners(connectionGeneration: number): void {
     this.peerConnection?.addEventListener('icecandidate', (event) => {
+      if (!this.isCurrentConnection(connectionGeneration)) {
+        return;
+      }
+
       if (!event.candidate) {
         return;
       }
@@ -65,7 +95,7 @@ export class WebRTCNetworkService implements INetworkService {
       }
 
       this.iceTimeoutRef = setTimeout(() => {
-        if (this.localIceBuffer.length > 0) {
+        if (this.isCurrentConnection(connectionGeneration) && this.localIceBuffer.length > 0) {
           this.mqttSignaling?.publish(SIGNAL_TYPE.ICE_BATCH, this.localIceBuffer);
           this.localIceBuffer = [];
         }
@@ -73,34 +103,50 @@ export class WebRTCNetworkService implements INetworkService {
     });
 
     this.peerConnection?.addEventListener('iceconnectionstatechange', () => {
-      if (!this.peerConnection) return;
+      if (!this.isCurrentConnection(connectionGeneration) || !this.peerConnection) return;
       const state = this.peerConnection.iceConnectionState;
 
-      if (state === 'connected') {
+      if (state === 'connected' || state === 'completed') {
+        this.reconnectAttempt = 0;
+        this.clearReconnectTimeout();
         this.updateStatus('connected');
-        this.mqttSignaling?.disconnect()
+        this.mqttSignaling?.disconnect();
+        this.mqttSignaling = null;
       }
 
       if (state === 'failed' || state === 'disconnected') {
-        console.error('[WebRTC] Соединение ICE упало в статус FAILED');
-        this.updateStatus('failed');
-        this.disconnect()
+        console.error(`[WebRTC] Соединение ICE потеряно, статус: ${state}`);
+        this.scheduleReconnect(`ICE ${state}`, connectionGeneration, state === 'failed');
       }
     });
 
     this.peerConnection?.addEventListener('datachannel', (event) => {
+      if (!this.isCurrentConnection(connectionGeneration)) {
+        return;
+      }
+
       if (event.channel) {
-        this.setupDataChannel(event.channel);
+        this.setupDataChannel(event.channel, connectionGeneration);
       }
     });
   }
 
-  private initMqtt() {
+  private initMqtt(connectionGeneration: number) {
     this.mqttSignaling = new MqttSignalingService(
-      (packet) => this.handleSignalingPacket(packet),
+      (packet) => {
+        if (!this.isCurrentConnection(connectionGeneration)) {
+          return;
+        }
+
+        return this.handleSignalingPacket(packet);
+      },
       (err) => {
+        if (!this.isCurrentConnection(connectionGeneration)) {
+          return;
+        }
+
         console.error('[SIGNALLING] Ошибка сигналинга MQTT:', err);
-        this.updateStatus('failed');
+        this.scheduleReconnect('MQTT signaling failure', connectionGeneration, false);
       },
     );
     this.mqttSignaling.connect(this.roomHash, this.myPeerId);
@@ -176,7 +222,7 @@ export class WebRTCNetworkService implements INetworkService {
   private async createOfferAsInitiator(): Promise<void> {
     if (!this.peerConnection) return;
     const channel = this.peerConnection.createDataChannel(DATA_CHANNEL_LABEL, DATA_CHANNEL_OPTIONS);
-    this.setupDataChannel(channel);
+    this.setupDataChannel(channel, this.connectionGeneration);
     const offer = await this.peerConnection.createOffer();
     await this.peerConnection.setLocalDescription(offer);
     this.mqttSignaling?.publish(SIGNAL_TYPE.OFFER, offer);
@@ -216,13 +262,35 @@ export class WebRTCNetworkService implements INetworkService {
     await this.peerConnection.setRemoteDescription(packet.payload);
   }
 
-  private setupDataChannel(channel: IStrictDataChannel) {
+  private setupDataChannel(channel: IStrictDataChannel, connectionGeneration: number) {
     this.dataChannel = channel;
     channel.addEventListener('message', (event) => {
+      if (!this.isCurrentConnection(connectionGeneration)) {
+        return;
+      }
+
       if (this.dataCallback && event.data) this.dataCallback(event.data);
     });
-    channel.addEventListener('open', () => this.updateStatus('connected'));
-    channel.addEventListener('close', () => this.updateStatus('disconnected'));
+    channel.addEventListener('open', () => {
+      if (!this.isCurrentConnection(connectionGeneration)) {
+        return;
+      }
+
+      this.reconnectAttempt = 0;
+      this.clearReconnectTimeout();
+      this.updateStatus('connected');
+    });
+    channel.addEventListener('close', () => {
+      if (!this.isCurrentConnection(connectionGeneration)) {
+        return;
+      }
+
+      if (this.dataChannel === channel) {
+        this.dataChannel = null;
+      }
+
+      this.scheduleReconnect('data channel closed', connectionGeneration, false);
+    });
   }
 
   async sendData(payload: string): Promise<void> {
@@ -231,14 +299,91 @@ export class WebRTCNetworkService implements INetworkService {
   }
 
   disconnect():void {
-    this.mqttSignaling?.disconnect();
-    if (this.dataChannel) this.dataChannel.close();
-    if (this.peerConnection) this.peerConnection.close();
-
-    this.dataChannel = null;
-    this.peerConnection = null;
+    this.isManualDisconnect = true;
+    this.roomHash = '';
+    this.reconnectAttempt = 0;
+    this.clearReconnectTimeout();
+    this.releaseConnectionResources();
     this.updateStatus('disconnected');
     router.replace('/');
+  }
+
+  private scheduleReconnect(reason: string, connectionGeneration: number, immediate: boolean): void {
+    if (!this.isCurrentConnection(connectionGeneration) || this.reconnectTimeoutRef) {
+      return;
+    }
+
+    if (this.reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) {
+      console.error(`[WebRTC] Reconnect attempts exhausted after ${reason}`);
+      this.releaseConnectionResources();
+      this.updateStatus('failed');
+      return;
+    }
+
+    const attempt = this.reconnectAttempt + 1;
+    const delayMs = immediate
+      ? 0
+      : Math.min(RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_DELAY_MS);
+
+    this.reconnectAttempt = attempt;
+    this.updateStatus('connecting');
+
+    this.reconnectTimeoutRef = setTimeout(() => {
+      this.reconnectTimeoutRef = null;
+
+      if (!this.isCurrentConnection(connectionGeneration)) {
+        return;
+      }
+
+      console.warn(`[WebRTC] Reconnect attempt ${attempt}/${RECONNECT_MAX_ATTEMPTS} after ${reason}`);
+      this.startConnection('connecting');
+    }, delayMs);
+  }
+
+  private releaseConnectionResources(): void {
+    this.connectionGeneration += 1;
+    this.clearIceTimeout();
+    this.localIceBuffer = [];
+
+    const mqttSignaling = this.mqttSignaling;
+    const dataChannel = this.dataChannel;
+    const peerConnection = this.peerConnection;
+
+    this.mqttSignaling = null;
+    this.dataChannel = null;
+    this.peerConnection = null;
+
+    mqttSignaling?.disconnect();
+
+    try {
+      dataChannel?.close();
+    } catch {
+      // ignore close errors
+    }
+
+    try {
+      peerConnection?.close();
+    } catch {
+      // ignore close errors
+    }
+  }
+
+  private isCurrentConnection(connectionGeneration: number): boolean {
+    return !this.isManualDisconnect && connectionGeneration === this.connectionGeneration;
+  }
+
+  private clearIceTimeout(): void {
+    if (this.iceTimeoutRef) {
+      clearTimeout(this.iceTimeoutRef);
+      this.iceTimeoutRef = null;
+    }
+  }
+
+  private clearReconnectTimeout(): void {
+    if (this.reconnectTimeoutRef) {
+      clearTimeout(this.reconnectTimeoutRef);
+      this.reconnectTimeoutRef = null;
+    }
   }
 
   private updateStatus(status: ConnectionStatus) {

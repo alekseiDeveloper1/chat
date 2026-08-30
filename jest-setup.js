@@ -1,4 +1,10 @@
 import 'react-native-get-random-values'
+jest.mock('expo-router', () => ({
+    router: {
+        replace: jest.fn(),
+    },
+}));
+
 jest.mock('expo-crypto', () => {
     const crypto = require('crypto');
     return {
@@ -24,19 +30,106 @@ jest.mock('expo-sqlite', () => {
         useSQLiteContext: () => mockDb,
     };
 });
-global.RTCPeerConnection = jest.fn().mockImplementation(() => ({
-  createDataChannel: jest.fn().mockReturnValue({
-    send: jest.fn(),
-    close: jest.fn(),
-  }),
-  createOffer: jest.fn().mockResolvedValue({ sdp: 'mock-offer', type: 'offer' }),
-  setLocalDescription: jest.fn().mockResolvedValue(null),
-  setRemoteDescription: jest.fn().mockResolvedValue(null),
-  addIceCandidate: jest.fn().mockResolvedValue(null),
-  close: jest.fn(),
+
+const mockPeerConnections = [];
+const createMockDataChannel = () => {
+    const listeners = {};
+
+    return {
+        send: jest.fn(),
+        close: jest.fn(() => listeners.close?.()),
+        addEventListener: jest.fn((type, listener) => {
+            listeners[type] = listener;
+        }),
+        __emit: (type, event) => listeners[type]?.(event),
+    };
+};
+
+const MockRTCPeerConnection = jest.fn().mockImplementation(() => {
+    const listeners = {};
+    const peerConnection = {
+        iceConnectionState: 'new',
+        localDescription: null,
+        remoteDescription: null,
+        createDataChannel: jest.fn(() => {
+            const channel = createMockDataChannel();
+            peerConnection.__dataChannel = channel;
+            return channel;
+        }),
+        createOffer: jest.fn().mockResolvedValue({ sdp: 'mock-offer', type: 'offer' }),
+        createAnswer: jest.fn().mockResolvedValue({ sdp: 'mock-answer', type: 'answer' }),
+        setLocalDescription: jest.fn(function (desc) {
+            peerConnection.localDescription = desc;
+            return Promise.resolve();
+        }),
+        setRemoteDescription: jest.fn(function (desc) {
+            peerConnection.remoteDescription = desc;
+            return Promise.resolve();
+        }),
+        addIceCandidate: jest.fn().mockResolvedValue(null),
+        close: jest.fn(),
+        addEventListener: jest.fn((type, listener) => {
+            listeners[type] = listener;
+        }),
+        __emitIceConnectionStateChange: (state) => {
+            peerConnection.iceConnectionState = state;
+            listeners.iceconnectionstatechange?.();
+        },
+        __emitIceCandidate: (candidate) => listeners.icecandidate?.({ candidate }),
+        __emitDataChannel: (channel = createMockDataChannel()) => {
+            listeners.datachannel?.({ channel });
+            return channel;
+        },
+    };
+
+    mockPeerConnections.push(peerConnection);
+    return peerConnection;
+});
+
+global.__mockPeerConnections = mockPeerConnections;
+
+jest.mock('react-native-webrtc', () => ({
+    registerGlobals: jest.fn(),
+    RTCPeerConnection: MockRTCPeerConnection,
+}));
+
+const mockMqttClients = [];
+const MockMqttClient = jest.fn().mockImplementation(function () {
+    this.connected = false;
+    this.sentMessages = [];
+    this.subscribedTopics = [];
+    this.connect = jest.fn((options) => {
+        this.connectOptions = options;
+        this.connected = true;
+        options.onSuccess?.({});
+    });
+    this.disconnect = jest.fn(() => {
+        this.connected = false;
+        this.onConnectionLost?.({ errorCode: 0, errorMessage: '' });
+    });
+    this.isConnected = jest.fn(() => this.connected);
+    this.subscribe = jest.fn((topic) => {
+        this.subscribedTopics.push(topic);
+    });
+    this.send = jest.fn((message) => {
+        this.sentMessages.push(message);
+    });
+
+    mockMqttClients.push(this);
+});
+
+jest.mock('paho-mqtt', () => ({
+    Client: MockMqttClient,
+    Message: jest.fn().mockImplementation(function (payloadString) {
+        this.payloadString = payloadString;
+        this.destinationName = '';
+        this.qos = 0;
+    }),
+    __mockMqttClients: mockMqttClients,
 }));
 
 beforeEach(() => {
     jest.clearAllMocks();
+    mockPeerConnections.length = 0;
+    mockMqttClients.length = 0;
 });
-

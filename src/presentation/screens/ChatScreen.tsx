@@ -1,6 +1,21 @@
 import React, { useState } from 'react';
 import { View, Text, TextInput, Button, FlatList } from 'react-native';
 import { useChat } from '@/presentation/hooks/useChat';
+import { ConnectionStatus } from '@/domain/services/INetworkService';
+
+const STATUS_LABELS: Record<ConnectionStatus, string> = {
+  connected: 'В СЕТИ (Прямой канал)',
+  connecting: 'Восстановление соединения...',
+  disconnected: 'Отключено',
+  failed: 'Не удалось подключиться',
+  signaling: 'Подключение...',
+};
+
+const getStatusColor = (status: ConnectionStatus): string => {
+  if (status === 'connected') return 'green';
+  if (status === 'failed') return 'red';
+  return 'orange';
+};
 
 export function ChatScreen() {
   const { messages, connectionStatus, inRoom, joinRoom, sendMessage } = useChat();
@@ -24,9 +39,9 @@ export function ChatScreen() {
         <Text style={{
           fontWeight: 'bold',
           marginBottom: 10,
-          color: connectionStatus === 'connected' ? 'green' : 'orange'
+          color: getStatusColor(connectionStatus)
         }}>
-          Статус P2P: {connectionStatus === 'connected' ? 'В СЕТИ (Прямой канал)' : 'Подключение...'}
+          Статус P2P: {STATUS_LABELS[connectionStatus]}
         </Text>
 
         <FlatList

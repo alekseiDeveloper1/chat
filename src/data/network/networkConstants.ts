@@ -15,6 +15,9 @@ export const MQTT_MESSAGE_QOS = 1;
 
 export const ICE_BATCH_DELAY_MS = 300;
 export const MQTT_PING_INTERVAL_MS = 30_000;
+export const RECONNECT_BASE_DELAY_MS = 1_500;
+export const RECONNECT_MAX_DELAY_MS = 15_000;
+export const RECONNECT_MAX_ATTEMPTS = 6;
 
 export const DATA_CHANNEL_LABEL = 'chat-channel';
 export const DATA_CHANNEL_OPTIONS = { ordered: true }
