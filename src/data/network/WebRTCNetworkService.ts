@@ -1,6 +1,6 @@
 import { router } from 'expo-router';
 import { registerGlobals, RTCPeerConnection } from 'react-native-webrtc';
-import { INetworkService, ConnectionStatus } from '@/domain/services/INetworkService';
+import { INetworkService, ConnectionStatus, DisconnectOptions } from '@/domain/services/INetworkService';
 import { IStrictDataChannel, IStrictPeerConnection, SignalingPacket } from './webrtcTypes';
 import {
   DATA_CHANNEL_LABEL,
@@ -14,6 +14,7 @@ import {
   generatePeerId,
 } from './networkConstants';
 import {MqttSignalingService} from "@/data/network/MqttSignalingService";
+import { AppLogger, appLogger } from '@/shared/logging/AppLogger';
 registerGlobals();
 
 export class WebRTCNetworkService implements INetworkService {
@@ -34,6 +35,8 @@ export class WebRTCNetworkService implements INetworkService {
   private connectionGeneration = 0;
   private isManualDisconnect = true;
 
+  constructor(private readonly logger: AppLogger = appLogger) {}
+
   onStatusChanged(callback: (status: ConnectionStatus) => void): void {
     this.statusCallback = callback;
   }
@@ -43,22 +46,48 @@ export class WebRTCNetworkService implements INetworkService {
   }
 
   async connect(roomHash: string): Promise<void> {
+    if (!this.isManualDisconnect && (this.peerConnection || this.dataChannel || this.mqttSignaling)) {
+      this.logger.warn('webrtc', 'Повторный запуск P2P транспорта при активных ресурсах', {
+        context: this.getResourceSnapshot(),
+        visibleToUser: true,
+      });
+    }
+
     this.roomHash = roomHash;
     this.isManualDisconnect = false;
     this.reconnectAttempt = 0;
     this.clearReconnectTimeout();
+    this.logger.info('webrtc', 'P2P транспорт запускается', {
+      context: {
+        roomFingerprint: this.getRoomFingerprint(),
+        peerId: this.myPeerId,
+      },
+      visibleToUser: true,
+    });
     this.startConnection('signaling', true);
   }
 
   private startConnection(status: ConnectionStatus, rethrowNativeError = false): void {
     this.releaseConnectionResources();
     this.isInitiator = false;
+    this.logger.info('webrtc', 'Создание WebRTC PeerConnection', {
+      context: {
+        ...this.getResourceSnapshot(),
+        targetStatus: status,
+        rethrowNativeError,
+      },
+      visibleToUser: true,
+    });
     this.updateStatus(status);
 
     try {
       this.peerConnection = new RTCPeerConnection(RTC_CONFIGURATION) as unknown as IStrictPeerConnection;
     } catch (nativeError) {
-      console.error(`[CRITICAL ERROR] Нативный конструктор WebRTC рухнул:`, nativeError);
+      this.logger.error('webrtc', 'Нативный конструктор WebRTC не создал соединение', {
+        error: nativeError,
+        context: this.getResourceSnapshot(),
+        visibleToUser: true,
+      });
       this.updateStatus('failed');
 
       if (!rethrowNativeError && !this.isManualDisconnect) {
@@ -72,6 +101,9 @@ export class WebRTCNetworkService implements INetworkService {
       throw nativeError;
     }
 
+    this.logger.debug('webrtc', 'WebRTC PeerConnection создан', {
+      context: this.getResourceSnapshot(),
+    });
     this.setupPeerConnectionListeners(this.connectionGeneration);
     this.initMqtt(this.connectionGeneration);
   }
@@ -96,6 +128,13 @@ export class WebRTCNetworkService implements INetworkService {
 
       this.iceTimeoutRef = setTimeout(() => {
         if (this.isCurrentConnection(connectionGeneration) && this.localIceBuffer.length > 0) {
+          this.logger.debug('webrtc', 'Отправляется batch ICE кандидатов', {
+            context: {
+              candidateCount: this.localIceBuffer.length,
+              generation: connectionGeneration,
+              roomFingerprint: this.getRoomFingerprint(),
+            },
+          });
           this.mqttSignaling?.publish(SIGNAL_TYPE.ICE_BATCH, this.localIceBuffer);
           this.localIceBuffer = [];
         }
@@ -105,17 +144,32 @@ export class WebRTCNetworkService implements INetworkService {
     this.peerConnection?.addEventListener('iceconnectionstatechange', () => {
       if (!this.isCurrentConnection(connectionGeneration) || !this.peerConnection) return;
       const state = this.peerConnection.iceConnectionState;
+      this.logger.info('webrtc', `ICE состояние изменилось: ${state}`, {
+        context: {
+          generation: connectionGeneration,
+          reconnectAttempt: this.reconnectAttempt,
+          roomFingerprint: this.getRoomFingerprint(),
+        },
+        visibleToUser: state === 'connected' || state === 'completed' || state === 'failed' || state === 'disconnected',
+      });
 
       if (state === 'connected' || state === 'completed') {
         this.reconnectAttempt = 0;
         this.clearReconnectTimeout();
         this.updateStatus('connected');
+        this.logger.info('webrtc', 'Прямое ICE соединение установлено, MQTT сигналинг отключается', {
+          context: this.getResourceSnapshot(),
+          visibleToUser: true,
+        });
         this.mqttSignaling?.disconnect();
         this.mqttSignaling = null;
       }
 
       if (state === 'failed' || state === 'disconnected') {
-        console.error(`[WebRTC] Соединение ICE потеряно, статус: ${state}`);
+        this.logger.warn('webrtc', `ICE соединение потеряно: ${state}`, {
+          context: this.getResourceSnapshot(),
+          visibleToUser: true,
+        });
         this.scheduleReconnect(`ICE ${state}`, connectionGeneration, state === 'failed');
       }
     });
@@ -126,12 +180,26 @@ export class WebRTCNetworkService implements INetworkService {
       }
 
       if (event.channel) {
+        this.logger.info('webrtc', 'Получен входящий DataChannel', {
+          context: {
+            generation: connectionGeneration,
+            roomFingerprint: this.getRoomFingerprint(),
+          },
+          visibleToUser: true,
+        });
         this.setupDataChannel(event.channel, connectionGeneration);
       }
     });
   }
 
   private initMqtt(connectionGeneration: number) {
+    this.logger.info('webrtc', 'Запуск MQTT сигналинга для обмена WebRTC пакетами', {
+      context: {
+        generation: connectionGeneration,
+        roomFingerprint: this.getRoomFingerprint(),
+      },
+      visibleToUser: true,
+    });
     this.mqttSignaling = new MqttSignalingService(
       (packet) => {
         if (!this.isCurrentConnection(connectionGeneration)) {
@@ -145,9 +213,17 @@ export class WebRTCNetworkService implements INetworkService {
           return;
         }
 
-        console.error('[SIGNALLING] Ошибка сигналинга MQTT:', err);
+        this.logger.error('webrtc', 'Ошибка MQTT сигналинга в WebRTC слое', {
+          error: err,
+          context: {
+            generation: connectionGeneration,
+            roomFingerprint: this.getRoomFingerprint(),
+          },
+          visibleToUser: true,
+        });
         this.scheduleReconnect('MQTT signaling failure', connectionGeneration, false);
       },
+      this.logger,
     );
     this.mqttSignaling.connect(this.roomHash, this.myPeerId);
   }
@@ -158,7 +234,10 @@ export class WebRTCNetworkService implements INetworkService {
     }
 
     if (!this.peerConnection) {
-      console.warn(`[SIGNALLING] Получен пакет ${packet.type}, но peerConnection равен null`);
+      this.logger.warn('webrtc', `Получен signaling пакет ${packet.type}, но PeerConnection отсутствует`, {
+        context: this.getResourceSnapshot(),
+        visibleToUser: true,
+      });
       return;
     }
 
@@ -166,7 +245,11 @@ export class WebRTCNetworkService implements INetworkService {
     try {
       await this.dispatchSignalingPacket(packet);
     } catch (error) {
-      console.error(`[SIGNALLING] Критическая ошибка обработки пакета [${packet.type}]:`, error);
+      this.logger.error('webrtc', `Критическая ошибка обработки signaling пакета: ${packet.type}`, {
+        error,
+        context: this.getResourceSnapshot(),
+        visibleToUser: true,
+      });
     }
   }
 
@@ -191,7 +274,12 @@ export class WebRTCNetworkService implements INetworkService {
         break;
       default:
         if (packet.type.startsWith('ice_') && !packet.type.endsWith(this.myPeerId)) {
-          await this.peerConnection.addIceCandidate(packet.payload).catch((e) => console.warn('[ICE] Ошибка добавления единичного кандидата:', e));
+          await this.peerConnection.addIceCandidate(packet.payload).catch((e) => {
+            this.logger.warn('webrtc', 'Ошибка добавления единичного ICE кандидата', {
+              error: e,
+              context: this.getResourceSnapshot(),
+            });
+          });
         }
         break;
     }
@@ -200,8 +288,20 @@ export class WebRTCNetworkService implements INetworkService {
   private async handleIceBatch(packet: SignalingPacket): Promise<void> {
     if (!this.peerConnection || !Array.isArray(packet.payload)) return;
 
+    this.logger.debug('webrtc', 'Обработка batch ICE кандидатов', {
+      context: {
+        candidateCount: packet.payload.length,
+        roomFingerprint: this.getRoomFingerprint(),
+      },
+    });
+
     for (const candidate of packet.payload) {
-      await this.peerConnection.addIceCandidate(candidate).catch((e) => console.warn('[ICE] Нативный отказ добавления кандидата:', e));
+      await this.peerConnection.addIceCandidate(candidate).catch((e) => {
+        this.logger.warn('webrtc', 'Ошибка добавления ICE кандидата из batch', {
+          error: e,
+          context: this.getResourceSnapshot(),
+        });
+      });
     }
   }
 
@@ -211,6 +311,14 @@ export class WebRTCNetworkService implements INetworkService {
     }
 
     this.isInitiator = Number(this.myPeerId) > Number(packet.senderId);
+    this.logger.info('webrtc', 'Обнаружен участник комнаты', {
+      context: {
+        generation: this.connectionGeneration,
+        isInitiator: this.isInitiator,
+        roomFingerprint: this.getRoomFingerprint(),
+      },
+      visibleToUser: true,
+    });
 
     if (this.isInitiator) {
       await this.createOfferAsInitiator();
@@ -221,6 +329,10 @@ export class WebRTCNetworkService implements INetworkService {
 
   private async createOfferAsInitiator(): Promise<void> {
     if (!this.peerConnection) return;
+    this.logger.info('webrtc', 'Создание WebRTC offer как инициатор', {
+      context: this.getResourceSnapshot(),
+      visibleToUser: true,
+    });
     const channel = this.peerConnection.createDataChannel(DATA_CHANNEL_LABEL, DATA_CHANNEL_OPTIONS);
     this.setupDataChannel(channel, this.connectionGeneration);
     const offer = await this.peerConnection.createOffer();
@@ -234,6 +346,14 @@ export class WebRTCNetworkService implements INetworkService {
     }
 
     this.isInitiator = Number(this.myPeerId) > Number(packet.senderId);
+    this.logger.info('webrtc', 'Получен HELLO от участника комнаты', {
+      context: {
+        generation: this.connectionGeneration,
+        isInitiator: this.isInitiator,
+        roomFingerprint: this.getRoomFingerprint(),
+      },
+      visibleToUser: true,
+    });
 
     if (this.isInitiator) {
       await this.createOfferAsInitiator();
@@ -242,10 +362,21 @@ export class WebRTCNetworkService implements INetworkService {
 
   private async handleOffer(packet: SignalingPacket): Promise<void> {
     if (this.isInitiator || !this.peerConnection || this.peerConnection.remoteDescription) {
-      console.warn('[SIGNALLING] Пакет OFFER отклонен: я инициатор или RemoteDescription уже задан');
+      this.logger.warn('webrtc', 'Пакет OFFER отклонен', {
+        context: {
+          ...this.getResourceSnapshot(),
+          isInitiator: this.isInitiator,
+          hasRemoteDescription: Boolean(this.peerConnection?.remoteDescription),
+        },
+        visibleToUser: true,
+      });
       return;
     }
 
+    this.logger.info('webrtc', 'Получен WebRTC offer, создается answer', {
+      context: this.getResourceSnapshot(),
+      visibleToUser: true,
+    });
     await this.peerConnection.setRemoteDescription(packet.payload);
 
     const answer = await this.peerConnection.createAnswer();
@@ -256,14 +387,32 @@ export class WebRTCNetworkService implements INetworkService {
 
   private async handleAnswer(packet: SignalingPacket): Promise<void> {
     if (!this.isInitiator || !this.peerConnection || this.peerConnection.remoteDescription) {
-      console.warn('[SIGNALLING] Пакет ANSWER отклонен: я не инициатор или RemoteDescription уже задан');
+      this.logger.warn('webrtc', 'Пакет ANSWER отклонен', {
+        context: {
+          ...this.getResourceSnapshot(),
+          isInitiator: this.isInitiator,
+          hasRemoteDescription: Boolean(this.peerConnection?.remoteDescription),
+        },
+        visibleToUser: true,
+      });
       return;
     }
+    this.logger.info('webrtc', 'Получен WebRTC answer', {
+      context: this.getResourceSnapshot(),
+      visibleToUser: true,
+    });
     await this.peerConnection.setRemoteDescription(packet.payload);
   }
 
   private setupDataChannel(channel: IStrictDataChannel, connectionGeneration: number) {
     this.dataChannel = channel;
+    this.logger.info('webrtc', 'DataChannel настроен', {
+      context: {
+        generation: connectionGeneration,
+        roomFingerprint: this.getRoomFingerprint(),
+      },
+      visibleToUser: true,
+    });
     channel.addEventListener('message', (event) => {
       if (!this.isCurrentConnection(connectionGeneration)) {
         return;
@@ -278,6 +427,10 @@ export class WebRTCNetworkService implements INetworkService {
 
       this.reconnectAttempt = 0;
       this.clearReconnectTimeout();
+      this.logger.info('webrtc', 'Прямой канал сообщений открыт', {
+        context: this.getResourceSnapshot(),
+        visibleToUser: true,
+      });
       this.updateStatus('connected');
     });
     channel.addEventListener('close', () => {
@@ -289,23 +442,53 @@ export class WebRTCNetworkService implements INetworkService {
         this.dataChannel = null;
       }
 
+      this.logger.warn('webrtc', 'DataChannel закрылся', {
+        context: this.getResourceSnapshot(),
+        visibleToUser: true,
+      });
       this.scheduleReconnect('data channel closed', connectionGeneration, false);
     });
   }
 
   async sendData(payload: string): Promise<void> {
-    if (!this.dataChannel) throw new Error('Нет активного P2P соединения');
+    if (!this.dataChannel) {
+      this.logger.error('webrtc', 'Отправка невозможна: нет активного P2P соединения', {
+        context: this.getResourceSnapshot(),
+        visibleToUser: true,
+      });
+      throw new Error('Нет активного P2P соединения');
+    }
+
     this.dataChannel.send(payload);
+    this.logger.debug('webrtc', 'Данные отправлены через DataChannel', {
+      context: this.getResourceSnapshot(),
+    });
   }
 
-  disconnect():void {
+  disconnect(options: DisconnectOptions = {}):void {
     this.isManualDisconnect = true;
+    this.logger.info('webrtc', 'P2P транспорт отключается', {
+      context: {
+        ...this.getResourceSnapshot(),
+        reason: options.reason ?? 'manual',
+      },
+      visibleToUser: options.reason !== 'screen_unmount',
+    });
     this.roomHash = '';
     this.reconnectAttempt = 0;
     this.clearReconnectTimeout();
     this.releaseConnectionResources();
-    this.updateStatus('disconnected');
-    router.replace('/');
+
+    if (options.reason === 'screen_unmount') {
+      this.statusCallback = null;
+      this.dataCallback = null;
+    } else {
+      this.updateStatus('disconnected');
+    }
+
+    if (options.navigateHome ?? true) {
+      router.replace('/');
+    }
   }
 
   private scheduleReconnect(reason: string, connectionGeneration: number, immediate: boolean): void {
@@ -314,7 +497,10 @@ export class WebRTCNetworkService implements INetworkService {
     }
 
     if (this.reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) {
-      console.error(`[WebRTC] Reconnect attempts exhausted after ${reason}`);
+      this.logger.error('webrtc', `Попытки восстановления исчерпаны: ${reason}`, {
+        context: this.getResourceSnapshot(),
+        visibleToUser: true,
+      });
       this.releaseConnectionResources();
       this.updateStatus('failed');
       return;
@@ -327,6 +513,14 @@ export class WebRTCNetworkService implements INetworkService {
 
     this.reconnectAttempt = attempt;
     this.updateStatus('connecting');
+    this.logger.warn('webrtc', `Запланировано восстановление соединения: ${reason}`, {
+      context: {
+        ...this.getResourceSnapshot(),
+        attempt,
+        delayMs,
+      },
+      visibleToUser: true,
+    });
 
     this.reconnectTimeoutRef = setTimeout(() => {
       this.reconnectTimeoutRef = null;
@@ -335,12 +529,17 @@ export class WebRTCNetworkService implements INetworkService {
         return;
       }
 
-      console.warn(`[WebRTC] Reconnect attempt ${attempt}/${RECONNECT_MAX_ATTEMPTS} after ${reason}`);
+      this.logger.warn('webrtc', `Попытка восстановления ${attempt}/${RECONNECT_MAX_ATTEMPTS}: ${reason}`, {
+        context: this.getResourceSnapshot(),
+        visibleToUser: true,
+      });
       this.startConnection('connecting');
     }, delayMs);
   }
 
   private releaseConnectionResources(): void {
+    const hadResources = Boolean(this.mqttSignaling || this.dataChannel || this.peerConnection || this.iceTimeoutRef);
+    const previousSnapshot = this.getResourceSnapshot();
     this.connectionGeneration += 1;
     this.clearIceTimeout();
     this.localIceBuffer = [];
@@ -366,6 +565,12 @@ export class WebRTCNetworkService implements INetworkService {
     } catch {
       // ignore close errors
     }
+
+    if (hadResources) {
+      this.logger.debug('webrtc', 'Ресурсы соединения освобождены', {
+        context: previousSnapshot,
+      });
+    }
   }
 
   private isCurrentConnection(connectionGeneration: number): boolean {
@@ -387,6 +592,28 @@ export class WebRTCNetworkService implements INetworkService {
   }
 
   private updateStatus(status: ConnectionStatus) {
+    this.logger.info('webrtc', `Статус P2P изменен: ${status}`, {
+      context: this.getResourceSnapshot(),
+      visibleToUser: status !== 'disconnected',
+    });
     if (this.statusCallback) this.statusCallback(status);
+  }
+
+  private getRoomFingerprint(): string | null {
+    return this.roomHash ? this.roomHash.slice(0, 8) : null;
+  }
+
+  private getResourceSnapshot() {
+    return {
+      generation: this.connectionGeneration,
+      roomFingerprint: this.getRoomFingerprint(),
+      peerId: this.myPeerId,
+      reconnectAttempt: this.reconnectAttempt,
+      hasPeerConnection: Boolean(this.peerConnection),
+      hasDataChannel: Boolean(this.dataChannel),
+      hasMqtt: Boolean(this.mqttSignaling),
+      hasIceTimer: Boolean(this.iceTimeoutRef),
+      hasReconnectTimer: Boolean(this.reconnectTimeoutRef),
+    };
   }
 }

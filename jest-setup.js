@@ -94,6 +94,44 @@ jest.mock('react-native-webrtc', () => ({
 }));
 
 const mockMqttClients = [];
+const createMockMqttClient = () => {
+    const listeners = {};
+    const client = {
+        connected: false,
+        sentMessages: [],
+        subscribedTopics: [],
+        on: jest.fn((type, listener) => {
+            listeners[type] = listener;
+            return client;
+        }),
+        subscribe: jest.fn((topic, callback) => {
+            client.subscribedTopics.push(topic);
+            callback?.(null);
+        }),
+        publish: jest.fn((topic, messageBody, options) => {
+            client.sentMessages.push({ topic, messageBody, options });
+        }),
+        end: jest.fn(() => {
+            client.connected = false;
+        }),
+        __emit: (type, ...args) => listeners[type]?.(...args),
+    };
+
+    mockMqttClients.push(client);
+    return client;
+};
+const mockMqttConnect = jest.fn(() => createMockMqttClient());
+
+jest.mock('mqtt', () => ({
+    __esModule: true,
+    default: {
+        connect: mockMqttConnect,
+    },
+    connect: mockMqttConnect,
+    MqttClient: jest.fn(),
+    __mockMqttClients: mockMqttClients,
+}));
+
 const MockMqttClient = jest.fn().mockImplementation(function () {
     this.connected = false;
     this.sentMessages = [];

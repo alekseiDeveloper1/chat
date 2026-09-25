@@ -1,5 +1,10 @@
 export type ConnectionStatus = 'disconnected' | 'signaling' | 'connecting' | 'connected' | 'failed';
 
+export interface DisconnectOptions {
+  navigateHome?: boolean;
+  reason?: string;
+}
+
 export interface INetworkService {
   connect(roomHash: string): Promise<void>;
 
@@ -9,5 +14,5 @@ export interface INetworkService {
 
   onStatusChanged(callback: (status: ConnectionStatus) => void): void;
 
-  disconnect(): void;
+  disconnect(options?: DisconnectOptions): void;
 }

@@ -12,6 +12,8 @@ describe('WebRTCNetworkService (P2P Транспорт)', () => {
   let networkService: WebRTCNetworkService;
 
   beforeEach(() => {
+    jest.spyOn(console, 'debug').mockImplementation(() => {});
+    jest.spyOn(console, 'info').mockImplementation(() => {});
     jest.spyOn(console, 'error').mockImplementation(() => {});
     jest.spyOn(console, 'warn').mockImplementation(() => {});
     networkService = new WebRTCNetworkService();
