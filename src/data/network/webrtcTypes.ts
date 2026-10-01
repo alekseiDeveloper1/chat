@@ -1,8 +1,10 @@
 export interface IStrictDataChannel {
+  readonly readyState: string;
+  readonly bufferedAmount: number;
   send(data: string): void;
   close(): void;
-  addEventListener(type: 'message', listener: (event: { data: string }) => void): void;
-  addEventListener(type: 'open' | 'close', listener: () => void): void;
+  addEventListener(type: 'message', listener: (event: { data: unknown }) => void): void;
+  addEventListener(type: 'open' | 'close' | 'error', listener: () => void): void;
 }
 
 export interface IStrictPeerConnection {

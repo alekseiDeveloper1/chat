@@ -15,11 +15,13 @@ import {
 } from './networkConstants';
 import {MqttSignalingService} from "@/data/network/MqttSignalingService";
 import { AppLogger, appLogger } from '@/shared/logging/AppLogger';
+import { DataChannelTransport } from './DataChannelTransport';
 registerGlobals();
 
 export class WebRTCNetworkService implements INetworkService {
   private peerConnection: IStrictPeerConnection | null = null;
   private dataChannel: IStrictDataChannel | null = null;
+  private dataTransport: DataChannelTransport | null = null;
   private mqttSignaling: MqttSignalingService | null = null;
 
   private statusCallback: ((status: ConnectionStatus) => void) | null = null;
@@ -405,7 +407,18 @@ export class WebRTCNetworkService implements INetworkService {
   }
 
   private setupDataChannel(channel: IStrictDataChannel, connectionGeneration: number) {
+    const previousChannel = this.dataChannel;
+    this.dataTransport?.dispose();
     this.dataChannel = channel;
+    const isCurrentChannel = (): boolean => this.isCurrentConnection(connectionGeneration) &&
+      this.dataChannel === channel && this.dataTransport === transport;
+    const transport = new DataChannelTransport(channel, isCurrentChannel);
+    this.dataTransport = transport;
+    if (previousChannel && previousChannel !== channel) {
+      try {
+        previousChannel.close();
+      } catch {  }
+    }
     this.logger.info('webrtc', 'DataChannel настроен', {
       context: {
         generation: connectionGeneration,
@@ -414,14 +427,24 @@ export class WebRTCNetworkService implements INetworkService {
       visibleToUser: true,
     });
     channel.addEventListener('message', (event) => {
-      if (!this.isCurrentConnection(connectionGeneration)) {
+      if (!isCurrentChannel()) {
         return;
       }
 
-      if (this.dataCallback && event.data) this.dataCallback(event.data);
+      let payload: string | null;
+      try {
+        payload = transport.receive(event.data);
+      } catch (error) {
+        this.logger.warn('webrtc', 'Некорректный фрагмент сообщения отклонён', {
+          error,
+          context: { generation: connectionGeneration },
+        });
+        return;
+      }
+      if (payload) this.dataCallback?.(payload);
     });
     channel.addEventListener('open', () => {
-      if (!this.isCurrentConnection(connectionGeneration)) {
+      if (!isCurrentChannel()) {
         return;
       }
 
@@ -434,13 +457,13 @@ export class WebRTCNetworkService implements INetworkService {
       this.updateStatus('connected');
     });
     channel.addEventListener('close', () => {
-      if (!this.isCurrentConnection(connectionGeneration)) {
+      if (!isCurrentChannel()) {
         return;
       }
 
-      if (this.dataChannel === channel) {
-        this.dataChannel = null;
-      }
+      transport.dispose();
+      this.dataTransport = null;
+      this.dataChannel = null;
 
       this.logger.warn('webrtc', 'DataChannel закрылся', {
         context: this.getResourceSnapshot(),
@@ -448,10 +471,20 @@ export class WebRTCNetworkService implements INetworkService {
       });
       this.scheduleReconnect('data channel closed', connectionGeneration, false);
     });
+    channel.addEventListener('error', () => {
+      if (!isCurrentChannel()) return;
+      transport.dispose();
+      this.dataTransport = null;
+      this.logger.error('webrtc', 'Ошибка передачи через DataChannel', {
+        context: this.getResourceSnapshot(),
+        visibleToUser: true,
+      });
+      this.scheduleReconnect('data channel error', connectionGeneration, true);
+    });
   }
 
   async sendData(payload: string): Promise<void> {
-    if (!this.dataChannel) {
+    if (!this.dataChannel || !this.dataTransport) {
       this.logger.error('webrtc', 'Отправка невозможна: нет активного P2P соединения', {
         context: this.getResourceSnapshot(),
         visibleToUser: true,
@@ -459,7 +492,7 @@ export class WebRTCNetworkService implements INetworkService {
       throw new Error('Нет активного P2P соединения');
     }
 
-    this.dataChannel.send(payload);
+    await this.dataTransport.send(payload);
     this.logger.debug('webrtc', 'Данные отправлены через DataChannel', {
       context: this.getResourceSnapshot(),
     });
@@ -541,6 +574,8 @@ export class WebRTCNetworkService implements INetworkService {
     const hadResources = Boolean(this.mqttSignaling || this.dataChannel || this.peerConnection || this.iceTimeoutRef);
     const previousSnapshot = this.getResourceSnapshot();
     this.connectionGeneration += 1;
+    this.dataTransport?.dispose();
+    this.dataTransport = null;
     this.clearIceTimeout();
     this.localIceBuffer = [];
 

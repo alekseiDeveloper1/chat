@@ -35,14 +35,24 @@ const mockPeerConnections = [];
 const createMockDataChannel = () => {
     const listeners = {};
 
-    return {
+    const channel = {
+        readyState: 'open',
+        bufferedAmount: 0,
         send: jest.fn(),
-        close: jest.fn(() => listeners.close?.()),
+        close: jest.fn(() => {
+            channel.readyState = 'closed';
+            listeners.close?.();
+        }),
         addEventListener: jest.fn((type, listener) => {
             listeners[type] = listener;
         }),
-        __emit: (type, event) => listeners[type]?.(event),
+        __emit: (type, event) => {
+            if (type === 'open') channel.readyState = 'open';
+            if (type === 'close') channel.readyState = 'closed';
+            listeners[type]?.(event);
+        },
     };
+    return channel;
 };
 
 const MockRTCPeerConnection = jest.fn().mockImplementation(() => {

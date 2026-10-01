@@ -1,8 +1,17 @@
 import { WebRTCNetworkService } from '@/data/network/WebRTCNetworkService';
 import { router } from 'expo-router';
+import { MAX_BUFFERED_AMOUNT } from '@/data/network/DataChannelTransport';
+
+type MockDataChannel = {
+  readyState: string;
+  bufferedAmount: number;
+  send: jest.Mock;
+  __emit: (type: string, event?: unknown) => void;
+};
 
 type MockPeerConnection = {
   __emitIceConnectionStateChange: (state: string) => void;
+  __emitDataChannel: () => MockDataChannel;
 };
 
 const getMockPeerConnections = (): MockPeerConnection[] =>
@@ -61,4 +70,48 @@ describe('WebRTCNetworkService (P2P Транспорт)', () => {
       'Нет активного P2P соединения'
     );
   });
+
+  it('собирает фрагменты перед передачей зашифрованных данных подписчику', async () => {
+    jest.useFakeTimers();
+    const onData = jest.fn();
+    networkService.onDataReceived(onData);
+    await networkService.connect('room-hash');
+    const channel = getMockPeerConnections()[0].__emitDataChannel();
+    const chunk = (offset: number, data: string) => '!chat-chunk-v1!' + JSON.stringify({
+      id: 'attachment', offset, total: 6, data,
+    });
+    channel.__emit('message', { data: chunk(0, 'abc') });
+    expect(onData).not.toHaveBeenCalled();
+    channel.__emit('message', { data: chunk(3, 'def') });
+    expect(onData).toHaveBeenCalledWith('abcdef');
+    channel.__emit('message', { data: '!chat-chunk-v1!broken' });
+    expect(onData).toHaveBeenCalledTimes(1);
+    networkService.disconnect({ navigateHome: false });
+  });
+
+  it.each(['close', 'error', 'disconnect', 'reconnect'])(
+    'отменяет ожидающую отправку при %s и игнорирует старый канал', async (cause) => {
+      jest.useFakeTimers();
+      const onData = jest.fn();
+      const onStatus = jest.fn();
+      networkService.onDataReceived(onData);
+      networkService.onStatusChanged(onStatus);
+      await networkService.connect('room-hash');
+      const channel = getMockPeerConnections()[0].__emitDataChannel();
+      channel.bufferedAmount = MAX_BUFFERED_AMOUNT;
+      const rejected = expect(networkService.sendData('payload')).rejects.toThrow('прервано');
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+      if (cause === 'disconnect') networkService.disconnect({ navigateHome: false });
+      else if (cause === 'reconnect') await networkService.connect('new-room');
+      else channel.__emit(cause);
+      await rejected;
+      const statusCount = onStatus.mock.calls.length;
+      channel.__emit('message', { data: 'stale' });
+      channel.__emit('open');
+      expect(channel.send).not.toHaveBeenCalled();
+      expect(onData).not.toHaveBeenCalled();
+      expect(onStatus).toHaveBeenCalledTimes(statusCount);
+      networkService.disconnect({ navigateHome: false });
+    },
+  );
 });
