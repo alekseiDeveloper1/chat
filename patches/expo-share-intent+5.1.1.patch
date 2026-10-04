@@ -1,0 +1,285 @@
+diff --git a/node_modules/expo-share-intent/android/src/main/java/expo/modules/shareintent/ExpoShareIntentModule.kt b/node_modules/expo-share-intent/android/src/main/java/expo/modules/shareintent/ExpoShareIntentModule.kt
+index 0153c89..3e1c254 100644
+--- a/node_modules/expo-share-intent/android/src/main/java/expo/modules/shareintent/ExpoShareIntentModule.kt
++++ b/node_modules/expo-share-intent/android/src/main/java/expo/modules/shareintent/ExpoShareIntentModule.kt
+@@ -55,59 +55,64 @@ class ExpoShareIntentModule : Module() {
+             instance!!.sendEvent("onError", mapOf("value" to message))
+         }
+ 
+-        @SuppressLint("Range")
+-        private fun getFileInfo(uri: Uri): Map<String, String?> {
+-            val resolver: ContentResolver? = instance?.currentActivity?.contentResolver
+-                    ?: instance?.context?.contentResolver
+-            if (resolver == null) {
+-                notifyError("Cannot get resolver (getFileInfo)")
+-                return mapOf(
+-                    "contentUri" to uri.toString(),
+-                    "filePath" to instance?.getAbsolutePath(uri),
+-                )
+-            }
+-            val queryResult: Cursor = resolver.query(uri, null, null, null, null)!!
+-            queryResult.moveToFirst()
+-            val fileName = queryResult.getString(queryResult.getColumnIndex(OpenableColumns.DISPLAY_NAME))
+-            val fileSize = queryResult.getString(queryResult.getColumnIndex(OpenableColumns.SIZE))
+-            queryResult.close()
+-
+-            val mimeType = resolver.getType(uri)!!
+-
+-            var mediaWidth: String? = null;
+-            var mediaHeight: String? = null;
+-            var mediaDuration: String? = null;
+-            if (mimeType.startsWith("image/")) {
+-                val options = BitmapFactory.Options().apply {
+-                    inJustDecodeBounds = true
++        private fun getFileInfo(uri: Uri, fallbackMimeType: String?): Map<String, String?> {
++            val resolver = instance?.context?.contentResolver
++                ?: throw IllegalStateException("Cannot get resolver (getFileInfo)")
++            var fileName: String? = uri.lastPathSegment
++            var fileSize: String? = null
++            // Providers may omit either column, return an empty cursor, or expose only a stream.
++            runCatching {
++                resolver.query(uri, null, null, null, null)?.use { cursor ->
++                    if (cursor.moveToFirst()) {
++                        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
++                        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
++                        if (nameIndex >= 0 && !cursor.isNull(nameIndex)) fileName = cursor.getString(nameIndex)
++                        if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) fileSize = cursor.getString(sizeIndex)
++                    }
+                 }
+-                BitmapFactory.decodeStream(resolver.openInputStream(uri), null, options)
+-                mediaHeight = options.outHeight.toString()
+-                mediaWidth = options.outWidth.toString()
+             }
+-            if (mimeType.startsWith("video/")) {
+-                val retriever = MediaMetadataRetriever()
+-                retriever.setDataSource(instance?.getAbsolutePath(uri))
+-                mediaWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt().toString() ?: null
+-                mediaHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt().toString() ?: null
+-                // Check orientation and flip size if required
+-                val metaRotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toInt() ?: 0;
+-                if (metaRotation == 90 || metaRotation == 270) {
+-                    mediaWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt().toString() ?: null
+-                    mediaHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt().toString() ?: null
++            val mimeType = runCatching { resolver.getType(uri) }.getOrNull()
++                ?: fallbackMimeType?.takeUnless { it.contains("*") }
++                ?: "application/octet-stream"
++            var mediaWidth: String? = null
++            var mediaHeight: String? = null
++            var mediaDuration: String? = null
++            // Missing media metadata must not prevent receiving the file itself.
++            runCatching {
++                if (mimeType.startsWith("image/")) {
++                    val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
++                    resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
++                    mediaWidth = options.outWidth.takeIf { it > 0 }?.toString()
++                    mediaHeight = options.outHeight.takeIf { it > 0 }?.toString()
++                } else if (mimeType.startsWith("video/")) {
++                    val retriever = MediaMetadataRetriever()
++                    try {
++                        retriever.setDataSource(instance!!.context, uri)
++                        mediaWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
++                        mediaHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
++                        val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull()
++                        if (rotation == 90 || rotation == 270) {
++                            val width = mediaWidth
++                            mediaWidth = mediaHeight
++                            mediaHeight = width
++                        }
++                        mediaDuration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
++                    } finally {
++                        retriever.release()
++                    }
+                 }
+-                mediaDuration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toInt().toString() ?: null
+             }
+-
+             return mapOf(
+-                    "contentUri" to uri.toString(),
+-                    "filePath" to instance?.getAbsolutePath(uri),
+-                    "fileName" to fileName,
+-                    "fileSize" to fileSize,
+-                    "mimeType" to mimeType,
+-                    "width" to mediaWidth,
+-                    "height" to mediaHeight,
+-                    "duration" to mediaDuration
++                "contentUri" to uri.toString(),
++                // Let the app import content URIs after checking metadata. Resolving a
++                // path here can bypass scoped storage or overwrite a same-name file.
++                "filePath" to if (uri.scheme == "file") uri.path else null,
++                "fileName" to fileName,
++                "fileSize" to fileSize,
++                "mimeType" to mimeType,
++                "width" to mediaWidth,
++                "height" to mediaHeight,
++                "duration" to mediaDuration
+             )
+         }
+ 
+@@ -122,40 +127,35 @@ class ExpoShareIntentModule : Module() {
+                 return
+             }
+             if (intent.type == null) return
+-            if (intent.type!!.startsWith("text/plain")) {
+-                // text / urls
+-                if (intent.action == Intent.ACTION_SEND) {
++            try {
++                val uris = when (intent.action) {
++                    Intent.ACTION_SEND -> listOfNotNull(intent.parcelable<Uri>(Intent.EXTRA_STREAM))
++                    Intent.ACTION_SEND_MULTIPLE -> intent.parcelableArrayList<Uri>(Intent.EXTRA_STREAM) ?: emptyList()
++                    else -> emptyList()
++                }
++                val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
++                    ?: intent.getStringExtra(Intent.EXTRA_HTML_TEXT)
++                val meta = mapOf("title" to (
++                    intent.getCharSequenceExtra(Intent.EXTRA_TITLE)?.toString()
++                        ?: intent.getCharSequenceExtra(Intent.EXTRA_SUBJECT)?.toString()
++                ))
++                if (uris.isNotEmpty()) {
++                    // EXTRA_STREAM also carries text/plain documents; prioritize it over MIME type.
+                     notifyShareIntent(mapOf(
+-                        "text" to intent.getStringExtra(Intent.EXTRA_TEXT),
+-                        "type" to "text",
+-                        "meta" to mapOf(
+-                            "title" to intent.getCharSequenceExtra(Intent.EXTRA_TITLE),
+-                        )
++                        "files" to uris.map { getFileInfo(it, intent.type) },
++                        "type" to "file",
++                        "text" to text,
++                        "meta" to meta
+                     ))
+-                } else if (intent.action == Intent.ACTION_VIEW) {
+-                    notifyShareIntent(mapOf( "text" to intent.dataString, "type" to "text"))
+-                } else {
+-                    notifyError("Invalid action for text sharing: " + intent.action)
+-                }
+-            } else {
+-                // files / medias
+-                if (intent.action == Intent.ACTION_SEND) {
+-                    val uri = intent.parcelable<Uri>(Intent.EXTRA_STREAM);
+-                    if (uri != null) {
+-                        notifyShareIntent(mapOf( "files" to arrayOf(getFileInfo(uri), "type" to "file")))
+-                    } else {
+-                        notifyError("empty uri for file sharing: " + intent.action)
+-                    }
+-                } else if (intent.action == Intent.ACTION_SEND_MULTIPLE) {
+-                    val uris = intent.parcelableArrayList<Uri>(Intent.EXTRA_STREAM)
+-                    if (uris != null) {
+-                        notifyShareIntent(mapOf( "files" to uris.map { getFileInfo(it) }, "type" to "file"))
+-                    } else {
+-                        notifyError("empty uris array for file sharing: " + intent.action)
+-                    }
+-                } else {
+-                    notifyError("Invalid action for file sharing: " + intent.action)
++                } else if (intent.action == Intent.ACTION_SEND && text != null) {
++                    notifyShareIntent(mapOf("text" to text, "type" to "text", "meta" to meta))
++                } else if (intent.action == Intent.ACTION_VIEW && intent.type?.startsWith("text/") == true) {
++                    notifyShareIntent(mapOf("text" to intent.dataString, "type" to "text"))
++                } else if (intent.action == Intent.ACTION_SEND || intent.action == Intent.ACTION_SEND_MULTIPLE) {
++                    notifyError("No readable text or files in shared content")
+                 }
++            } catch (error: Exception) {
++                notifyError("Cannot read shared content: " + error.message)
+             }
+         }
+ 
+diff --git a/node_modules/expo-share-intent/build/utils.js b/node_modules/expo-share-intent/build/utils.js
+index 3d343c6..5fb7f57 100644
+--- a/node_modules/expo-share-intent/build/utils.js
++++ b/node_modules/expo-share-intent/build/utils.js
+@@ -57,23 +57,36 @@ export const parseShareIntent = (value, options) => {
+     else {
+         shareIntent = value; // Android
+     }
+-    if (shareIntent?.text) {
++    const stringOrNull = (value) => typeof value === "string" && value.length ? value : null;
++    const numberOrNull = (value) => {
++        if ((typeof value !== "number" && typeof value !== "string") || value === "") return null;
++        const number = Number(value);
++        return Number.isFinite(number) && number >= 0 ? number : null;
++    };
++    const sharedText = stringOrNull(shareIntent?.text);
++    const sharedWebUrl = Array.isArray(shareIntent?.weburls)
++        ? shareIntent.weburls.find((item) => stringOrNull(item?.url))
++        : null;
++    const sharedFiles = Array.isArray(shareIntent?.files)
++        ? shareIntent.files.filter((file) => file && (stringOrNull(file.path) || stringOrNull(file.filePath) || stringOrNull(file.contentUri)))
++        : [];
++    if (sharedText && !sharedFiles.length) {
+         // Try to find the webURL in the SharedIntent text
+-        const webUrl = shareIntent.text
++        const webUrl = sharedText
+             .match(/[(http(s)?)://(www.)?-a-zA-Z0-9@:%._+~#=]{2,256}\.[a-z]{2,6}\b([-a-zA-Z0-9@:%_+.~#?&//=]*)/gi)
+             ?.find((link) => link.startsWith("http")) || null;
+         result = {
+             ...SHAREINTENT_DEFAULTVALUE,
+             type: webUrl ? "weburl" : "text",
+-            text: shareIntent.text,
++            text: sharedText,
+             webUrl,
+             meta: {
+-                title: shareIntent.meta?.title ?? undefined,
++                title: stringOrNull(shareIntent.meta?.title) ?? undefined,
+             },
+         };
+     }
+-    else if (shareIntent?.weburls?.length) {
+-        const weburl = shareIntent.weburls[0];
++    else if (sharedWebUrl && !sharedFiles.length) {
++        const weburl = sharedWebUrl;
+         result = {
+             ...SHAREINTENT_DEFAULTVALUE,
+             type: "weburl",
+@@ -84,34 +97,36 @@ export const parseShareIntent = (value, options) => {
+     }
+     else {
+         // Ensure we got a valid file. some array value are emply
+-        const files = shareIntent?.files?.filter((file) => file.path || file.contentUri) ||
+-            [];
+-        const isMedia = files.every((file) => file.mimeType.startsWith("image/") ||
+-            file.mimeType.startsWith("video/"));
++        const files = sharedFiles;
++        const isMedia = files.length > 0 && files.every((file) => stringOrNull(file.mimeType)?.startsWith("image/") ||
++            stringOrNull(file.mimeType)?.startsWith("video/"));
+         result = {
+             ...SHAREINTENT_DEFAULTVALUE,
+-            files: shareIntent?.files
+-                ? shareIntent.files.reduce((acc, file) => {
+-                    if (!file.path && !file.contentUri)
++            files: files.length
++                ? files.reduce((acc, file) => {
++                    if (!file.path && !file.filePath && !file.contentUri)
+                         return acc;
+                     return [
+                         ...acc,
+                         {
+-                            path: file.path ||
+-                                (file.filePath ? `file://${file.filePath}` : null) ||
+-                                file.contentUri ||
++                            path: stringOrNull(file.path) ||
++                                (stringOrNull(file.filePath) ? `file://${file.filePath.split("/").map(encodeURIComponent).join("/")}` : null) ||
++                                stringOrNull(file.contentUri) ||
+                                 null,
+-                            mimeType: file.mimeType || null,
+-                            fileName: file.fileName || null,
+-                            width: file.width ? Number(file.width) : null,
+-                            height: file.height ? Number(file.height) : null,
+-                            size: file.fileSize ? Number(file.fileSize) : null,
+-                            duration: file.duration ? Number(file.duration) : null,
++                            mimeType: stringOrNull(file.mimeType),
++                            fileName: stringOrNull(file.fileName),
++                            width: numberOrNull(file.width),
++                            height: numberOrNull(file.height),
++                            size: numberOrNull(file.fileSize),
++                            duration: numberOrNull(file.duration),
+                         },
+                     ];
+                 }, [])
+                 : null,
+-            type: isMedia ? "media" : "file",
++            type: files.length ? (isMedia ? "media" : "file") : null,
++            text: sharedText,
++            webUrl: sharedWebUrl?.url || null,
++            meta: { title: stringOrNull(shareIntent?.meta?.title) ?? undefined },
+         };
+     }
+     options.debug &&

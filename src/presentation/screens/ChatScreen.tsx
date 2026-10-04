@@ -1,11 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, TextInput, Button, FlatList, StyleSheet, Linking, Pressable } from 'react-native';
+import { View, Text, TextInput, Button, FlatList, ScrollView, StyleSheet, Linking, Pressable } from 'react-native';
 import { useChat } from '@/presentation/hooks/useChat';
 import { FileAttachment, MAX_ATTACHMENT_BYTES } from '@/domain/entities/Message';
 import { ConnectionStatus } from '@/domain/services/INetworkService';
 import { AttachmentError, openAttachment, pickAttachment } from '@/data/files/ChatAttachments';
 import { AppLogEntry, AppLogLevel, appLogger } from '@/shared/logging/AppLogger';
 import { splitMessageLinks } from '@/shared/links/messageLinks';
+import { SharedDraft } from '@/data/sharing/IncomingShare';
+import { useIncomingShares } from '@/presentation/sharing/IncomingShareProvider';
 
 const STATUS_LABELS: Record<ConnectionStatus, string> = {
   connected: 'В СЕТИ (Прямой канал)',
@@ -60,10 +62,12 @@ export function ChatScreen() {
     disconnectRoom,
     clearConnectionAlerts,
   } = useChat();
+  const { drafts: sharedDrafts, isImporting, removeDraft } = useIncomingShares();
   const [text, setText] = useState('');
   const [attachment, setAttachment] = useState<FileAttachment | null>(null);
   const [isPickingAttachment, setIsPickingAttachment] = useState(false);
   const [openingAttachmentId, setOpeningAttachmentId] = useState<string | null>(null);
+  const [sendingSharedDraftId, setSendingSharedDraftId] = useState<string | null>(null);
   const mountedRef = useRef(false);
   const roomVersionRef = useRef(0);
   const pickingRef = useRef(false);
@@ -85,6 +89,7 @@ export function ChatScreen() {
     openingRef.current = false;
     setIsPickingAttachment(false);
     setOpeningAttachmentId(null);
+    setSendingSharedDraftId(null);
     setText('');
     setAttachment(null);
   }, [inRoom]);
@@ -128,6 +133,23 @@ export function ChatScreen() {
       }
     } finally {
       if (isCurrentRoom(roomVersion)) sendingRef.current = false;
+    }
+  };
+
+  const handleSendSharedDraft = async (draft: SharedDraft) => {
+    if (!inRoom || sendingRef.current || pickingRef.current || isSending || connectionStatus !== 'connected') return;
+
+    const roomVersion = roomVersionRef.current;
+    sendingRef.current = true;
+    setSendingSharedDraftId(draft.id);
+    try {
+      const sent = await sendMessage(draft.text, draft.attachment);
+      if (sent && isCurrentRoom(roomVersion)) removeDraft(draft.id);
+    } finally {
+      if (isCurrentRoom(roomVersion)) {
+        sendingRef.current = false;
+        setSendingSharedDraftId(null);
+      }
     }
   };
 
@@ -209,10 +231,55 @@ export function ChatScreen() {
     );
   };
 
+  const renderSharedDrafts = () => {
+    if (!isImporting && sharedDrafts.length === 0) return null;
+
+    const busy = isSending || isPickingAttachment || sendingSharedDraftId !== null;
+    return (
+      <View style={styles.sharedPanel}>
+        <Text style={styles.sharedTitle}>Пересыл из другого приложения</Text>
+        {isImporting ? <Text style={styles.sharedHint}>Получение пересыла...</Text> : null}
+        {!inRoom ? (
+          <Text style={styles.sharedHint}>Войдите в комнату, чтобы отправить пересыл.</Text>
+        ) : connectionStatus !== 'connected' ? (
+          <Text style={styles.sharedHint}>Пересыл можно отправить после подключения.</Text>
+        ) : null}
+        <ScrollView style={styles.sharedList} nestedScrollEnabled>
+          {sharedDrafts.map((draft, index) => (
+            <View key={draft.id} style={styles.sharedDraft}>
+              {draft.text ? <Text selectable style={styles.messageText}>{draft.text}</Text> : null}
+              {draft.attachment ? (
+                <View style={styles.fileCard}>
+                  <Text style={styles.fileName}>{draft.attachment.name}</Text>
+                  <Text style={styles.fileDetails}>{formatFileSize(draft.attachment.size)}</Text>
+                </View>
+              ) : null}
+              <View style={styles.composerActions}>
+                <Button
+                  title={sendingSharedDraftId === draft.id ? 'Отправка пересыла...' : 'Отправить в комнату'}
+                  accessibilityLabel={`Отправить пересыл ${index + 1} в комнату`}
+                  disabled={!inRoom || connectionStatus !== 'connected' || busy}
+                  onPress={() => handleSendSharedDraft(draft)}
+                />
+                <Button
+                  title="Убрать пересыл"
+                  accessibilityLabel={`Убрать пересыл ${index + 1}`}
+                  disabled={sendingSharedDraftId === draft.id}
+                  onPress={() => removeDraft(draft.id)}
+                />
+              </View>
+            </View>
+          ))}
+        </ScrollView>
+      </View>
+    );
+  };
+
   if (!inRoom) {
     return (
       <View style={{ flex: 1, justifyContent: 'center', padding: 20 }}>
         {renderConnectionAlerts()}
+        {renderSharedDrafts()}
         <Button
           title={isJoining ? 'Подключение...' : 'Войти в комнату'}
           disabled={isJoining || connectionStatus === 'signaling' || connectionStatus === 'connecting'}
@@ -235,6 +302,7 @@ export function ChatScreen() {
       </Text>
 
       {renderConnectionAlerts()}
+      {renderSharedDrafts()}
 
       <FlatList
         data={messages}
@@ -299,19 +367,19 @@ export function ChatScreen() {
         placeholder={attachment ? 'Подпись к файлу (необязательно)...' : 'Напишите сообщение или вставьте ссылку...'}
         accessibilityLabel={attachment ? 'Подпись к файлу' : 'Текст сообщения или ссылка'}
         style={styles.messageInput}
-        editable={connectionStatus === 'connected' && !isSending}
+        editable={connectionStatus === 'connected' && !isSending && sendingSharedDraftId === null}
         multiline
       />
 
       <View style={styles.composerActions}>
         <Button
           title={isPickingAttachment ? 'Чтение файла...' : 'Прикрепить файл'}
-          disabled={connectionStatus !== 'connected' || isSending || isPickingAttachment}
+          disabled={connectionStatus !== 'connected' || isSending || isPickingAttachment || sendingSharedDraftId !== null}
           onPress={handlePickAttachment}
         />
         <Button
           title={isSending ? 'Отправка...' : 'Отправить'}
-          disabled={connectionStatus !== 'connected' || isSending || isPickingAttachment || (!text.trim() && !attachment)}
+          disabled={connectionStatus !== 'connected' || isSending || isPickingAttachment || sendingSharedDraftId !== null || (!text.trim() && !attachment)}
           onPress={handleSend}
         />
       </View>
@@ -329,6 +397,30 @@ export function ChatScreen() {
 }
 
 const styles = StyleSheet.create({
+  sharedPanel: {
+    marginBottom: 12,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: '#AABBCB',
+    borderRadius: 8,
+    backgroundColor: '#F0F6FC',
+  },
+  sharedTitle: {
+    color: '#24292F',
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  sharedHint: {
+    color: '#57606A',
+    marginBottom: 6,
+  },
+  sharedList: {
+    maxHeight: 240,
+  },
+  sharedDraft: {
+    gap: 8,
+    paddingVertical: 8,
+  },
   messageBubble: {
     maxWidth: '90%',
     marginVertical: 5,

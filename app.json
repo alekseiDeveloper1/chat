@@ -8,7 +8,8 @@
     "scheme": "chat",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/expo.icon",
+      "bundleIdentifier": "com.anonymous.chat"
     },
     "android": {
       "adaptiveIcon": {
@@ -26,6 +27,21 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-share-intent",
+        {
+          "androidIntentFilters": ["*/*"],
+          "androidMultiIntentFilters": ["*/*"],
+          "iosActivationRules": {
+            "NSExtensionActivationSupportsText": true,
+            "NSExtensionActivationSupportsWebURLWithMaxCount": 1,
+            "NSExtensionActivationSupportsWebPageWithMaxCount": 1,
+            "NSExtensionActivationSupportsImageWithMaxCount": 10,
+            "NSExtensionActivationSupportsMovieWithMaxCount": 10,
+            "NSExtensionActivationSupportsFileWithMaxCount": 10
+          }
+        }
+      ],
       [
         "expo-splash-screen",
         {
