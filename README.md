@@ -1,56 +1,92 @@
-# Welcome to your Expo app 👋
+# Chat
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Мобильный P2P-чат для обмена сообщениями и файлами в общей комнате. Приложение написано на React Native и Expo SDK 54, а навигация построена на Expo Router.
 
-## Get started
+## Возможности
 
-1. Install dependencies
+- Подключение к комнате по общему имени и паролю.
+- Обмен сообщениями через прямой WebRTC DataChannel. MQTT используется для сигнализации и установления соединения.
+- Локальная история сообщений в SQLite на устройстве.
+- Шифрование содержимого сообщений AES с ключом, полученным из пароля комнаты.
+- Отправка вложений размером до 5 МБ и приём текста и файлов через системное меню «Поделиться».
+- Автоматическое восстановление соединения и отображение событий подключения в приложении.
 
-   ```bash
-   npm install
-   ```
+Оба участника должны указать одинаковые имя комнаты и пароль. Сервер MQTT помогает установить P2P-соединение; содержимое сообщений передаётся через WebRTC DataChannel.
 
-2. Start the app
+## Требования
 
-   ```bash
-   npx expo start
-   ```
+- Node.js 20.19.x или новее в линейке 20.x.
+- Android Studio и Android SDK для сборки Android-приложения.
+- macOS и Xcode 16.1 или новее для локальной сборки iOS-приложения.
+- Для запуска в Expo Go доступен ограниченный набор возможностей; нативные модули WebRTC и приёма системных пересылок требуют development build.
 
-In the output, you'll find options to open the app in a
+Проект использует Expo SDK 54, React Native 0.81 и React 19.1. Перед установкой или обновлением Expo-пакетов сверяйтесь с [документацией Expo SDK 54](https://docs.expo.dev/versions/v54.0.0/).
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+## Установка и запуск
 
 ```bash
-npm run reset-project
+yarn install
+npx expo start
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+Откройте проект в установленном development build или запустите нативную сборку:
 
-### Other setup steps
+```bash
+# Android: устройство или эмулятор
+yarn android
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+# iOS: симулятор (только macOS с установленным Xcode)
+yarn ios
 
-## Learn more
+# Web
+yarn web
+```
 
-To learn more about developing your project with Expo, look at the following resources:
+Для подключения через туннель:
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+```bash
+yarn tunnel
+```
 
-## Join the community
+При первом запуске Android-команды Expo сгенерирует/обновит нативный проект и установит приложение на подключённое устройство или эмулятор. После изменения конфигурации Expo-плагинов пересоберите development build.
 
-Join our community of developers creating universal apps.
+## Настройки комнаты
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+Имя комнаты и пароль можно задать переменными окружения `EXPO_PUBLIC_ROOM_NAME` и `EXPO_PUBLIC_ROOM_PASSWORD`. Если они не заданы, приложение использует значения по умолчанию из экрана подключения.
+
+Для дополнительного пространства имён MQTT-топиков можно задать `EXPO_PUBLIC_MQTT_USER`. Без этой переменной используется корневой префикс брокера. Адрес брокера и STUN-сервер заданы в `src/data/network/networkConstants.ts`.
+
+Переменные с префиксом `EXPO_PUBLIC_` встраиваются в клиентское приложение и доступны пользователям сборки. Не помещайте в них секреты или учётные данные, которые должны оставаться конфиденциальными.
+
+Локально создайте `.env` в корне проекта, например:
+
+```dotenv
+EXPO_PUBLIC_ROOM_NAME=my-room
+EXPO_PUBLIC_ROOM_PASSWORD=use-a-long-unique-passphrase
+EXPO_PUBLIC_MQTT_USER=my-app
+```
+
+Не коммитьте `.env` и не используйте один пароль для приватных разговоров с разными участниками. Чтобы два клиента попали в одну комнату, им нужны одинаковые имя комнаты и пароль.
+
+## Структура проекта
+
+```text
+src/
+├── app/             # маршруты Expo Router и обработка входящей пересылки
+├── data/            # SQLite, шифрование, файлы, MQTT и WebRTC
+├── domain/          # сущность сообщения и логика чата
+├── presentation/    # экран чата, хуки и обработка пересылок
+└── shared/          # ссылки и журнал событий
+```
+
+## Команды разработки
+
+```bash
+yarn lint         # ESLint через Expo
+yarn test         # тесты Jest
+yarn test:watch   # Jest в режиме наблюдения
+```
+
+## Технологии
+
+Expo SDK 54 · React Native 0.81 · TypeScript · Expo Router · SQLite · WebRTC · MQTT · AES
