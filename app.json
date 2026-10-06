@@ -28,6 +28,14 @@
     "plugins": [
       "expo-router",
       [
+        "expo-notifications",
+        {
+          "defaultChannel": "chat-messages",
+          "color": "#208AEF"
+        }
+      ],
+      "./plugins/withChatBackgroundService",
+      [
         "expo-share-intent",
         {
           "androidIntentFilters": ["*/*"],

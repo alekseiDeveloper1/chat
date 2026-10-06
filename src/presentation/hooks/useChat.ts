@@ -6,8 +6,15 @@ import { WebRTCNetworkService } from '@/data/network/WebRTCNetworkService';
 import { FileAttachment, Message } from '@/domain/entities/Message';
 import { ConnectionStatus } from '@/domain/services/INetworkService';
 import { AppLogEntry, appLogger } from '@/shared/logging/AppLogger';
+import { Platform } from 'react-native';
+import { ChatNotifications } from '@/data/notifications/ChatNotifications';
+import { ChatBackgroundService } from '@/data/notifications/ChatBackgroundService';
 
 const MAX_VISIBLE_ALERTS = 8;
+
+const logBackgroundStopError = () => {
+  appLogger.error('notifications', 'Не удалось остановить фоновую службу чата', { visibleToUser: true });
+};
 
 export function useChat() {
   const engine = useMemo(() => {
@@ -17,6 +24,8 @@ export function useChat() {
       new WebRTCNetworkService()
     );
   }, []);
+  const notifications = useMemo(() => new ChatNotifications(), []);
+  const backgroundService = useMemo(() => new ChatBackgroundService(), []);
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
@@ -43,9 +52,10 @@ export function useChat() {
       joinInProgressRef.current = false;
       sendInProgressRef.current = false;
       unsubscribe();
+      backgroundService.stop().catch(logBackgroundStopError);
       engine.disconnect({ navigateHome: false, reason: 'screen_unmount' });
     };
-  }, [engine]);
+  }, [engine, backgroundService]);
 
   const refreshMessages = async (roomVersion = roomVersionRef.current) => {
     const history = await engine.getHistory();
@@ -67,14 +77,37 @@ export function useChat() {
     const roomVersion = ++roomVersionRef.current;
     setIsJoining(true);
     try {
-      await engine.joinRoom(roomName, password, () => {
-        void refreshMessages(roomVersion).catch(() => {
+      await notifications.prepare();
+      if (!mountedRef.current || roomVersion !== roomVersionRef.current) return;
+      try {
+        await backgroundService.start();
+      } catch {
+        if (mountedRef.current && roomVersion === roomVersionRef.current) {
+          appLogger.warn('notifications', 'Фоновая служба не запущена. При сворачивании прием сообщений может остановиться.', {
+            visibleToUser: true,
+          });
+        }
+      }
+      if (!mountedRef.current || roomVersion !== roomVersionRef.current) return;
+      if (Platform.OS === 'ios') {
+        appLogger.warn('notifications', 'На iOS сообщения поступают, пока приложение активно.', {
+          visibleToUser: true,
+        });
+      }
+      await engine.joinRoom(roomName, password, (message) => {
+        if (!mountedRef.current || roomVersion !== roomVersionRef.current) return;
+        notifications.showMessage(message, () => mountedRef.current && roomVersion === roomVersionRef.current);
+        refreshMessages(roomVersion).catch(() => {
           if (mountedRef.current && roomVersion === roomVersionRef.current) {
             appLogger.error('chat', 'Не удалось обновить историю сообщений', { visibleToUser: true });
           }
         });
       }, (nextStatus) => {
-        if (mountedRef.current && roomVersion === roomVersionRef.current) setStatus(nextStatus);
+        if (!mountedRef.current || roomVersion !== roomVersionRef.current) return;
+        setStatus(nextStatus);
+        if (nextStatus === 'failed') {
+          backgroundService.stop().catch(logBackgroundStopError);
+        }
       });
       if (!mountedRef.current || roomVersion !== roomVersionRef.current) return;
       setInRoom(true);
@@ -85,6 +118,13 @@ export function useChat() {
       });
     } catch (error) {
       if (!mountedRef.current || roomVersion !== roomVersionRef.current) return;
+      backgroundService.stop().catch(logBackgroundStopError);
+      try {
+        engine.disconnect({ navigateHome: false, reason: 'join_failed' });
+      } catch {
+        appLogger.error('chat', 'Не удалось освободить соединение после ошибки входа');
+      }
+      setInRoom(false);
       setStatus('failed');
       appLogger.error('chat', 'Не удалось войти в комнату', {
         error,
@@ -133,6 +173,7 @@ export function useChat() {
 
   const disconnect = () => {
     roomVersionRef.current += 1;
+    backgroundService.stop().catch(logBackgroundStopError);
     try {
       engine.disconnect({ navigateHome: true, reason: 'manual' });
     } catch (error) {

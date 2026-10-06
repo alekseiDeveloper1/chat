@@ -90,10 +90,10 @@ export class WebRTCNetworkService implements INetworkService {
         context: this.getResourceSnapshot(),
         visibleToUser: true,
       });
-      this.updateStatus('failed');
-
       if (!rethrowNativeError && !this.isManualDisconnect) {
         this.scheduleReconnect('native WebRTC constructor failed', this.connectionGeneration, true);
+      } else {
+        this.updateStatus('failed');
       }
 
       if (!rethrowNativeError) {

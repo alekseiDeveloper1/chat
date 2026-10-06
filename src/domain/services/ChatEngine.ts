@@ -6,6 +6,7 @@ import { appLogger } from '@/shared/logging/AppLogger';
 
 // A 5 MiB file is base64 encoded, encrypted, then base64 encoded again.
 const MAX_PACKET_CHARACTERS = 12 * 1024 * 1024;
+const MAX_RECENT_INCOMING_MESSAGES = 1000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -23,8 +24,10 @@ export class ChatEngine {
     private networkService: INetworkService
   ) {}
 
-  async joinRoom(roomName: string, password: string, onNewMessage: () => void, onStatusChange: (status: ConnectionStatus) => void): Promise<void> {
+  async joinRoom(roomName: string, password: string, onNewMessage: (message: Message) => void, onStatusChange: (status: ConnectionStatus) => void): Promise<void> {
     const session = ++this.session;
+    const recentIncomingIds = new Set<string>();
+    const pendingIncomingIds = new Set<string>();
     this.currentRoomId = null;
     this.currentRoomKey = null;
     appLogger.info('chat', 'Вход в комнату начат', {
@@ -66,6 +69,8 @@ export class ChatEngine {
           throw new Error('Некорректный пакет сообщения');
         }
 
+        if (recentIncomingIds.has(packet.id) || pendingIncomingIds.has(packet.id)) return;
+
         let text: string;
         let attachment: FileAttachment | undefined;
         if (packet.version === 2 && packet.contentType === 'attachment') {
@@ -102,8 +107,17 @@ export class ChatEngine {
           timestamp: packet.timestamp,
         };
 
-        await this.messageRepository.saveMessage(incomingMessage);
-        if (session === this.session) onNewMessage();
+        pendingIncomingIds.add(incomingMessage.id);
+        try {
+          await this.messageRepository.saveMessage(incomingMessage);
+          recentIncomingIds.add(incomingMessage.id);
+          if (recentIncomingIds.size > MAX_RECENT_INCOMING_MESSAGES) {
+            recentIncomingIds.delete(recentIncomingIds.values().next().value!);
+          }
+          if (session === this.session) onNewMessage(incomingMessage);
+        } finally {
+          pendingIncomingIds.delete(incomingMessage.id);
+        }
         appLogger.debug('chat', 'Входящее сообщение сохранено', {
           context: { hasAttachment: Boolean(attachment), attachmentBytes: attachment?.size },
         });

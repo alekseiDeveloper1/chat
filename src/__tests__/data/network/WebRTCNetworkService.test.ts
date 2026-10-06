@@ -1,6 +1,8 @@
 import { WebRTCNetworkService } from '@/data/network/WebRTCNetworkService';
 import { router } from 'expo-router';
 import { MAX_BUFFERED_AMOUNT } from '@/data/network/DataChannelTransport';
+import { RTCPeerConnection } from 'react-native-webrtc';
+import { RECONNECT_MAX_ATTEMPTS } from '@/data/network/networkConstants';
 
 type MockDataChannel = {
   readyState: string;
@@ -63,6 +65,51 @@ describe('WebRTCNetworkService (P2P Транспорт)', () => {
 
     expect(getMockPeerConnections()).toHaveLength(2);
     expect(router.replace).not.toHaveBeenCalled();
+  });
+
+  it('keeps reconnecting through a transient native constructor failure', async () => {
+    jest.useFakeTimers();
+    const onStatus = jest.fn();
+    networkService.onStatusChanged(onStatus);
+    await networkService.connect('room-hash');
+    jest.mocked(RTCPeerConnection).mockImplementationOnce(() => {
+      throw new Error('Temporary native failure');
+    });
+
+    getMockPeerConnections()[0].__emitIceConnectionStateChange('failed');
+    jest.advanceTimersToNextTimer();
+
+    expect(getMockPeerConnections()).toHaveLength(1);
+    expect(onStatus).not.toHaveBeenCalledWith('failed');
+    expect(onStatus).toHaveBeenLastCalledWith('connecting');
+
+    jest.advanceTimersToNextTimer();
+    expect(getMockPeerConnections()).toHaveLength(2);
+    getMockPeerConnections()[1].__emitIceConnectionStateChange('connected');
+    expect(onStatus).toHaveBeenLastCalledWith('connected');
+    expect(onStatus).not.toHaveBeenCalledWith('failed');
+    networkService.disconnect({ navigateHome: false });
+  });
+
+  it('reports terminal failure only after all native constructor retries are exhausted', async () => {
+    jest.useFakeTimers();
+    const onStatus = jest.fn();
+    networkService.onStatusChanged(onStatus);
+    await networkService.connect('room-hash');
+    for (let attempt = 0; attempt < RECONNECT_MAX_ATTEMPTS; attempt += 1) {
+      jest.mocked(RTCPeerConnection).mockImplementationOnce(() => {
+        throw new Error('Native constructor unavailable');
+      });
+    }
+
+    getMockPeerConnections()[0].__emitIceConnectionStateChange('failed');
+    jest.runAllTimers();
+
+    expect(RTCPeerConnection).toHaveBeenCalledTimes(RECONNECT_MAX_ATTEMPTS + 1);
+    expect(onStatus.mock.calls.filter(([status]) => status === 'failed')).toHaveLength(1);
+    expect(onStatus).toHaveBeenLastCalledWith('failed');
+    expect(jest.getTimerCount()).toBe(0);
+    networkService.disconnect({ navigateHome: false });
   });
 
   it('должен выбрасывать ошибку при попытке отправить данные без подключения', async () => {

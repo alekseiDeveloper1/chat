@@ -1,5 +1,5 @@
 export type AppLogLevel = 'debug' | 'info' | 'warn' | 'error';
-export type AppLogFeature = 'chat' | 'webrtc' | 'mqtt';
+export type AppLogFeature = 'chat' | 'webrtc' | 'mqtt' | 'notifications';
 
 type AppLogContextValue = string | number | boolean | null;
 type AppLogContext = Record<string, AppLogContextValue | undefined>;

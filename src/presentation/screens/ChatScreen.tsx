@@ -30,6 +30,7 @@ const FEATURE_LABELS: Record<AppLogEntry['feature'], string> = {
   chat: 'CHAT',
   webrtc: 'WEBRTC',
   mqtt: 'MQTT',
+  notifications: 'УВЕДОМЛЕНИЯ',
 };
 
 const formatLogTime = (timestamp: number): string =>

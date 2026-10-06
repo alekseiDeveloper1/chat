@@ -70,6 +70,7 @@ describe('ChatEngine attachments', () => {
     expect(repository.saveMessage).toHaveBeenLastCalledWith(expect.objectContaining({
       roomId, text, attachment, senderId: 'me',
     }));
+    expect(onNewMessage).not.toHaveBeenCalled();
 
     repository.saveMessage.mockClear();
     await receive(payload);
@@ -77,6 +78,7 @@ describe('ChatEngine attachments', () => {
       roomId, text, attachment, senderId: 'peer',
     }));
     expect(onNewMessage).toHaveBeenCalledTimes(1);
+    expect(onNewMessage).toHaveBeenCalledWith(repository.saveMessage.mock.calls[0][0]);
   });
 
   it('keeps text and links compatible with the existing packet format', async () => {
@@ -87,6 +89,50 @@ describe('ChatEngine attachments', () => {
     expect(crypto.decrypt(packet.encryptedText, roomKey)).toBe(text);
     await receive(JSON.stringify(packet));
     expect(repository.saveMessage).toHaveBeenLastCalledWith(expect.objectContaining({ text, senderId: 'peer' }));
+    expect(onNewMessage).toHaveBeenCalledWith(expect.objectContaining({ text, senderId: 'peer' }));
+  });
+
+  it('notifies only once for repeated incoming packets', async () => {
+    const payload = packetFrom({ text: 'New file', attachment }, roomKey, crypto);
+    await receive(payload);
+    await receive(payload);
+    expect(repository.saveMessage).toHaveBeenCalledTimes(1);
+    expect(onNewMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for persistence and ignores a duplicate while the save is pending', async () => {
+    let finishSave!: () => void;
+    repository.saveMessage.mockImplementationOnce(() => new Promise<void>((resolve) => { finishSave = resolve; }));
+    const payload = packetFrom({ text: '', attachment }, roomKey, crypto);
+    const incoming = receive(payload);
+    await receive(payload);
+    expect(repository.saveMessage).toHaveBeenCalledTimes(1);
+    expect(onNewMessage).not.toHaveBeenCalled();
+
+    finishSave();
+    await incoming;
+    expect(onNewMessage).toHaveBeenCalledTimes(1);
+    expect(onNewMessage).toHaveBeenCalledWith(repository.saveMessage.mock.calls[0][0]);
+  });
+
+  it('does not notify after a failed save and allows retrying the incoming packet', async () => {
+    repository.saveMessage.mockRejectedValueOnce(new Error('Database busy'));
+    const payload = packetFrom({ text: '', attachment }, roomKey, crypto);
+    await receive(payload);
+    expect(onNewMessage).not.toHaveBeenCalled();
+
+    await receive(payload);
+    expect(repository.saveMessage).toHaveBeenCalledTimes(2);
+    expect(onNewMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not notify when reading saved history', async () => {
+    const savedMessage: Message = {
+      id: 'saved-peer-message', roomId, text: 'Earlier message', senderId: 'peer', timestamp: 1,
+    };
+    repository.getMessagesByRoom.mockResolvedValueOnce([savedMessage]);
+    await expect(engine.getHistory()).resolves.toEqual([savedMessage]);
+    expect(onNewMessage).not.toHaveBeenCalled();
   });
 
   it('does not reinterpret a legacy JSON message as a file', async () => {
@@ -132,6 +178,7 @@ describe('ChatEngine attachments', () => {
     const wrongKey = await crypto.generateRoomKey('another-password');
     await receive(packetFrom({ text: '', attachment }, wrongKey, crypto));
     expect(repository.saveMessage).not.toHaveBeenCalled();
+    expect(onNewMessage).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -141,6 +188,7 @@ describe('ChatEngine attachments', () => {
   ])('rejects malformed envelopes without logging content', async (payload) => {
     await receive(payload);
     expect(repository.saveMessage).not.toHaveBeenCalled();
+    expect(onNewMessage).not.toHaveBeenCalled();
     expect(appLogger.error).toHaveBeenLastCalledWith(
       'chat', 'Не удалось обработать входящее сообщение', { visibleToUser: true },
     );
@@ -168,6 +216,18 @@ describe('ChatEngine attachments', () => {
     await engine.joinRoom('room-b', 'password-b', jest.fn(), jest.fn());
     await oldReceive(packetFrom({ text: '', attachment }, roomKey, crypto));
     expect(repository.saveMessage).not.toHaveBeenCalled();
+    expect(onNewMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps duplicate suppression scoped to the room session', async () => {
+    await receive(packetFrom({ text: '', attachment }, roomKey, crypto));
+    engine.disconnect();
+    const onNextRoomMessage = jest.fn();
+    await engine.joinRoom('room-b', 'password-b', onNextRoomMessage, jest.fn());
+    const nextRoomKey = await crypto.generateRoomKey('password-b');
+    await receive(packetFrom({ text: '', attachment }, nextRoomKey, crypto));
+    expect(onNewMessage).toHaveBeenCalledTimes(1);
+    expect(onNextRoomMessage).toHaveBeenCalledTimes(1);
   });
 
   it('does not notify a new screen when an old incoming save finishes', async () => {
