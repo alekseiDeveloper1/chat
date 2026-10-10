@@ -34,7 +34,7 @@ it('adds Android 14 service requirements once and keeps unrelated services and p
       'android:name': SERVICE_NAME,
       'android:foregroundServiceType': 'remoteMessaging',
       'android:exported': 'false',
-      'android:stopWithTask': 'true',
+      'android:stopWithTask': 'false',
     } },
   ]);
   expect(twice.manifest['uses-permission'].map((permission) => permission.$['android:name'])).toEqual([
@@ -45,16 +45,21 @@ it('adds Android 14 service requirements once and keeps unrelated services and p
   ]);
 });
 
-it('updates the existing background service declaration instead of duplicating it', async () => {
+it('updates the existing service to survive task removal instead of duplicating it', async () => {
   const manifest = {
     manifest: {
       application: [{
         $: { 'android:name': '.MainApplication' },
-        service: [{ $: { 'android:name': SERVICE_NAME, 'android:foregroundServiceType': 'dataSync' } }],
+        service: [{ $: {
+          'android:name': SERVICE_NAME,
+          'android:foregroundServiceType': 'dataSync',
+          'android:stopWithTask': 'true',
+        } }],
       }],
     },
   };
   const result = await applyPlugin(manifest);
   expect(result.manifest.application[0].service).toHaveLength(1);
   expect(result.manifest.application[0].service[0].$['android:foregroundServiceType']).toBe('remoteMessaging');
+  expect(result.manifest.application[0].service[0].$['android:stopWithTask']).toBe('false');
 });

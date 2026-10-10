@@ -19,7 +19,7 @@ module.exports = function withChatBackgroundService(config) {
     }
     service.$['android:foregroundServiceType'] = 'remoteMessaging';
     service.$['android:exported'] = 'false';
-    service.$['android:stopWithTask'] = 'true';
+    service.$['android:stopWithTask'] = 'false';
     application.service = services;
     return mod;
   });

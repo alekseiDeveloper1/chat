@@ -4,6 +4,7 @@ import { act, create } from 'react-test-renderer';
 import { ChatEngine } from '@/domain/services/ChatEngine';
 import { ChatNotifications } from '@/data/notifications/ChatNotifications';
 import { ChatBackgroundService } from '@/data/notifications/ChatBackgroundService';
+import * as SessionModule from '@/application/ChatSession';
 import { appLogger } from '@/shared/logging/AppLogger';
 import { useChat } from '../useChat';
 
@@ -18,6 +19,7 @@ const attachment = { name: 'notes.txt', mimeType: 'text/plain', size: 5, base64:
 
 describe('useChat', () => {
   let renderer;
+  let secondRenderer;
   let chat;
   let engine;
   let notifications;
@@ -52,11 +54,15 @@ describe('useChat', () => {
     ChatEngine.mockImplementation(() => engine);
     ChatNotifications.mockImplementation(() => notifications);
     ChatBackgroundService.mockImplementation(() => backgroundService);
+    const session = new SessionModule.ChatSession();
+    jest.spyOn(SessionModule, 'getChatSession').mockReturnValue(session);
     await act(async () => { renderer = create(<Harness />); });
   });
 
   afterEach(async () => {
     if (renderer) await act(async () => { renderer.unmount(); });
+    if (secondRenderer) await act(async () => { secondRenderer.unmount(); });
+    secondRenderer = null;
     jest.restoreAllMocks();
   });
 
@@ -214,17 +220,98 @@ describe('useChat', () => {
       expect(chat.inRoom).toBe(false);
     });
 
-    it('stops background reception and ignores incoming callbacks after unmounting', async () => {
+    it('receives notifications without a screen and restores the same room when remounted', async () => {
       await act(async () => { await chat.joinRoom('room', 'password'); });
       const onIncoming = engine.joinRoom.mock.calls[0][2];
       await act(async () => { renderer.unmount(); renderer = null; });
       engine.getHistory.mockClear();
+      engine.getHistory.mockResolvedValueOnce([incomingMessage]);
       await act(async () => { onIncoming(incomingMessage); });
 
-      expect(backgroundService.stop).toHaveBeenCalledTimes(1);
-      expect(engine.disconnect).toHaveBeenCalledWith({ navigateHome: false, reason: 'screen_unmount' });
-      expect(notifications.showMessage).not.toHaveBeenCalled();
-      expect(engine.getHistory).not.toHaveBeenCalled();
+      expect(backgroundService.stop).not.toHaveBeenCalled();
+      expect(engine.disconnect).not.toHaveBeenCalled();
+      expect(notifications.showMessage).toHaveBeenCalledWith(incomingMessage, expect.any(Function));
+      expect(notifications.showMessage.mock.calls[0][1]()).toBe(true);
+      expect(engine.getHistory).toHaveBeenCalledTimes(1);
+
+      await act(async () => { renderer = create(<Harness />); });
+      expect(chat.inRoom).toBe(true);
+      expect(chat.connectionStatus).toBe('connected');
+      expect(chat.messages).toEqual([incomingMessage]);
+      expect(ChatEngine).toHaveBeenCalledTimes(1);
+      expect(engine.joinRoom).toHaveBeenCalledTimes(1);
+      expect(backgroundService.start).toHaveBeenCalledTimes(1);
+      expect(notifications.showMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('finishes a pending join after the screen unmounts', async () => {
+      let finishJoin;
+      engine.joinRoom.mockImplementationOnce((_room, _password, _onMessage, onStatus) =>
+        new Promise((resolve) => {
+          finishJoin = () => { onStatus('connected'); resolve(); };
+        }));
+      let joining;
+      await act(async () => { joining = chat.joinRoom('room', 'password'); });
+      expect(chat.isJoining).toBe(true);
+      await act(async () => { renderer.unmount(); renderer = null; });
+      await act(async () => { finishJoin(); await joining; });
+
+      expect(engine.disconnect).not.toHaveBeenCalled();
+      expect(backgroundService.stop).not.toHaveBeenCalled();
+      await act(async () => { renderer = create(<Harness />); });
+      expect(chat.inRoom).toBe(true);
+      expect(chat.isJoining).toBe(false);
+      expect(chat.connectionStatus).toBe('connected');
+      expect(engine.joinRoom).toHaveBeenCalledTimes(1);
+    });
+
+    it('shares one connection across multiple screens without duplicating notifications', async () => {
+      let secondChat;
+      function SecondHarness() {
+        secondChat = useChat();
+        return null;
+      }
+      await act(async () => { secondRenderer = create(<SecondHarness />); });
+      await act(async () => {
+        await Promise.all([
+          chat.joinRoom('room', 'password'),
+          secondChat.joinRoom('room', 'password'),
+        ]);
+      });
+
+      expect(ChatEngine).toHaveBeenCalledTimes(1);
+      expect(engine.joinRoom).toHaveBeenCalledTimes(1);
+      expect(backgroundService.start).toHaveBeenCalledTimes(1);
+      expect(chat.inRoom).toBe(true);
+      expect(secondChat.inRoom).toBe(true);
+      const onIncoming = engine.joinRoom.mock.calls[0][2];
+      engine.getHistory.mockResolvedValueOnce([incomingMessage]);
+      await act(async () => { onIncoming(incomingMessage); });
+      expect(chat.messages).toEqual([incomingMessage]);
+      expect(secondChat.messages).toEqual([incomingMessage]);
+      expect(notifications.showMessage).toHaveBeenCalledTimes(1);
+
+      await act(async () => { renderer.unmount(); renderer = null; });
+      expect(backgroundService.stop).not.toHaveBeenCalled();
+      expect(engine.disconnect).not.toHaveBeenCalled();
+      expect(secondChat.connectionStatus).toBe('connected');
+    });
+
+    it('keeps the latest history when earlier refreshes finish after newer messages arrive', async () => {
+      await act(async () => { await chat.joinRoom('room', 'password'); });
+      const nextMessage = { ...incomingMessage, id: 'next', text: 'Next message', timestamp: 2 };
+      let finishEarlierHistory;
+      engine.getHistory
+        .mockImplementationOnce(() => new Promise((resolve) => { finishEarlierHistory = resolve; }))
+        .mockResolvedValueOnce([incomingMessage, nextMessage]);
+      const onIncoming = engine.joinRoom.mock.calls[0][2];
+      await act(async () => { onIncoming(incomingMessage); });
+      await act(async () => { onIncoming(nextMessage); });
+      expect(chat.messages).toEqual([incomingMessage, nextMessage]);
+
+      await act(async () => { finishEarlierHistory([incomingMessage]); });
+      expect(chat.messages).toEqual([incomingMessage, nextMessage]);
+      expect(notifications.showMessage).toHaveBeenCalledTimes(2);
     });
 
     it('keeps background reception during reconnection and stops it on terminal failure', async () => {
@@ -265,6 +352,26 @@ describe('useChat', () => {
       expect(backgroundService.stop).toHaveBeenCalledTimes(1);
       expect(chat.inRoom).toBe(false);
       expect(chat.isJoining).toBe(false);
+    });
+
+    it('does not connect after leaving while background startup is pending', async () => {
+      let finishBackgroundStart;
+      backgroundService.start.mockImplementationOnce(() =>
+        new Promise((resolve) => { finishBackgroundStart = resolve; }));
+      let joining;
+      await act(async () => { joining = chat.joinRoom('room', 'password'); });
+      expect(backgroundService.start).toHaveBeenCalledTimes(1);
+      expect(chat.isJoining).toBe(true);
+
+      await act(async () => { chat.disconnectRoom(); });
+      await act(async () => { finishBackgroundStart(); await joining; });
+
+      expect(engine.joinRoom).not.toHaveBeenCalled();
+      expect(backgroundService.stop).toHaveBeenCalledTimes(1);
+      expect(engine.disconnect).toHaveBeenCalledWith({ navigateHome: true, reason: 'manual' });
+      expect(chat.inRoom).toBe(false);
+      expect(chat.isJoining).toBe(false);
+      expect(chat.connectionStatus).toBe('disconnected');
     });
 
     it('keeps normal chat available and warns if background startup fails', async () => {

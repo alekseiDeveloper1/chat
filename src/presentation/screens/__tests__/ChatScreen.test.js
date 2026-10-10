@@ -22,7 +22,13 @@ describe('ChatScreen drafts', () => {
   let chat;
   let incoming;
 
-  const button = (title) => screen.root.findAllByType(Button).find((item) => item.props.title === title);
+  const button = (name) => screen.root.findAll((item) =>
+    typeof item.props.onPress === 'function' && (
+      item.props.accessibilityLabel === name ||
+      item.props.title === name ||
+      (item.props.accessibilityRole === 'button' && !item.props.accessibilityLabel &&
+        item.findAllByType(Text).some((text) => text.props.children === name))
+    ))[0];
   const input = () => screen.root.findByType(TextInput);
   const sharedButton = (label) => screen.root.findAllByType(Button).find((item) => item.props.accessibilityLabel === label);
   const hasText = (text) => screen.root.findAllByType(Text).some((item) => item.props.children === text);
@@ -60,16 +66,16 @@ describe('ChatScreen drafts', () => {
     chat.sendMessage.mockImplementation(() => new Promise((resolve) => { finishSend = resolve; }));
     pickAttachment.mockResolvedValue(attachment);
     await act(async () => { await button('Прикрепить файл').props.onPress(); });
-    expect(button('Отправить').props.disabled).toBe(false);
+    expect(button('Отправить сообщение').props.disabled).toBe(false);
 
     let sending;
-    await act(async () => { sending = button('Отправить').props.onPress(); });
+    await act(async () => { sending = button('Отправить сообщение').props.onPress(); });
     expect(chat.sendMessage).toHaveBeenCalledWith('', attachment);
     expect(button('Убрать')).toBeDefined();
 
     await act(async () => { finishSend(true); await sending; });
     expect(button('Убрать')).toBeUndefined();
-    expect(button('Отправить').props.disabled).toBe(true);
+    expect(button('Введите сообщение для отправки').props.disabled).toBe(true);
   });
 
   it('keeps the caption and file when sending fails', async () => {
@@ -79,7 +85,7 @@ describe('ChatScreen drafts', () => {
       input().props.onChangeText('Подпись');
       await button('Прикрепить файл').props.onPress();
     });
-    await act(async () => { await button('Отправить').props.onPress(); });
+    await act(async () => { await button('Отправить сообщение').props.onPress(); });
 
     expect(chat.sendMessage).toHaveBeenCalledWith('Подпись', attachment);
     expect(input().props.value).toBe('Подпись');
@@ -93,7 +99,7 @@ describe('ChatScreen drafts', () => {
       await button('Прикрепить файл').props.onPress();
     });
     await act(async () => { await button('Прикрепить файл').props.onPress(); });
-    await act(async () => { await button('Отправить').props.onPress(); });
+    await act(async () => { await button('Отправить сообщение').props.onPress(); });
 
     expect(chat.sendMessage).toHaveBeenCalledWith('Подпись', attachment);
   });
@@ -103,10 +109,10 @@ describe('ChatScreen drafts', () => {
     pickAttachment.mockImplementation(() => new Promise((resolve) => { finishPick = resolve; }));
     let picking;
     await act(async () => { picking = button('Прикрепить файл').props.onPress(); });
-    expect(button('Отправить').props.disabled).toBe(true);
+    expect(button('Введите сообщение для отправки').props.disabled).toBe(true);
 
     await act(async () => {
-      button('Разорвать соединение').props.onPress();
+      button('Завершить соединение').props.onPress();
       chat = { ...chat, inRoom: false };
       screen.update(<ChatScreen />);
     });
@@ -117,7 +123,7 @@ describe('ChatScreen drafts', () => {
     await act(async () => { finishPick(attachment); await picking; });
 
     expect(button('Убрать')).toBeUndefined();
-    expect(button('Отправить').props.disabled).toBe(true);
+    expect(button('Введите сообщение для отправки').props.disabled).toBe(true);
     expect(chat.sendMessage).not.toHaveBeenCalled();
   });
 
@@ -226,7 +232,7 @@ describe('ChatScreen drafts', () => {
     await act(async () => { sending = sharedButton('Отправить пересыл 1 в комнату').props.onPress(); });
 
     await act(async () => {
-      button('Разорвать соединение').props.onPress();
+      button('Завершить соединение').props.onPress();
       chat = { ...chat, inRoom: false, connectionStatus: 'disconnected' };
       screen.update(<ChatScreen />);
     });
